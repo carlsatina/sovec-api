@@ -1,0 +1,235 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  PASSENGER
+  DRIVER
+  ADMIN
+}
+
+enum RideStatus {
+  REQUESTED
+  FINDING_DRIVER
+  ASSIGNED
+  ARRIVING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  EWALLET
+  CARD
+}
+
+enum ApplicationStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  INTERVIEW
+  APPROVED
+  REJECTED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  phone     String   @unique
+  email     String?  @unique
+  role      UserRole @default(PASSENGER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profile           Profile?
+  savedPlaces       SavedPlace[]
+  ridesAsRider      Ride[] @relation("RideRider")
+  ridesAsDriver     Ride[] @relation("RideDriver")
+  payments          Payment[]
+  rewardWallet      RewardWallet?
+  notifications     Notification[]
+  supportTickets    SupportTicket[]
+  driverApplication DriverApplication?
+  vehicle           Vehicle?
+  driverLocation    DriverLocation?
+}
+
+model Profile {
+  id          String  @id @default(cuid())
+  userId      String  @unique
+  avatarUrl   String?
+  homeAddress String?
+  workAddress String?
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model SavedPlace {
+  id        String   @id @default(cuid())
+  userId    String
+  label     String
+  address   String
+  lat       Float
+  lng       Float
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model Ride {
+  id            String     @id @default(cuid())
+  riderId       String
+  driverId      String?
+  status        RideStatus @default(REQUESTED)
+  pickupAddress String
+  pickupLat     Float
+  pickupLng     Float
+  dropoffAddress String
+  dropoffLat    Float
+  dropoffLng    Float
+  fareAmount    Float
+  currency      String @default("PHP")
+  paymentMethod PaymentMethod
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  rider User  @relation("RideRider", fields: [riderId], references: [id])
+  driver User? @relation("RideDriver", fields: [driverId], references: [id])
+  events RideEvent[]
+  payment Payment?
+}
+
+model RideEvent {
+  id        String   @id @default(cuid())
+  rideId    String
+  type      String
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  ride Ride @relation(fields: [rideId], references: [id])
+}
+
+model Vehicle {
+  id          String @id @default(cuid())
+  driverId    String @unique
+  plateNumber String
+  model       String
+  capacity    Int
+  color       String?
+
+  driver User @relation(fields: [driverId], references: [id])
+}
+
+model Payment {
+  id        String        @id @default(cuid())
+  rideId    String        @unique
+  method    PaymentMethod
+  amount    Float
+  status    String
+  reference String?
+  createdAt DateTime      @default(now())
+
+  ride Ride @relation(fields: [rideId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
+  userId String?
+}
+
+model Promo {
+  id           String   @id @default(cuid())
+  code         String   @unique
+  discountType String
+  value        Float
+  expiresAt    DateTime
+  isActive     Boolean  @default(true)
+}
+
+model RewardWallet {
+  id       String @id @default(cuid())
+  userId   String @unique
+  balance  Float  @default(0)
+  points   Int    @default(0)
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  body      String
+  type      String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model SupportTicket {
+  id          String   @id @default(cuid())
+  userId      String
+  category    String
+  description String
+  status      String
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model DriverApplication {
+  id          String            @id @default(cuid())
+  userId      String            @unique
+  status      ApplicationStatus @default(DRAFT)
+  fullName    String?
+  phone       String?
+  email       String?
+  address     String?
+  experienceYears Int?
+  preferredArea  String?
+  submittedAt DateTime?
+  interviewAt DateTime?
+  notes       String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  user        User              @relation(fields: [userId], references: [id])
+  documents   DriverDocument[]
+  availability DriverAvailability?
+}
+
+model DriverDocument {
+  id              String @id @default(cuid())
+  applicationId   String
+  type            String
+  fileUrl         String
+  status          String @default("PENDING")
+  createdAt       DateTime @default(now())
+
+  application DriverApplication @relation(fields: [applicationId], references: [id])
+}
+
+model DriverAvailability {
+  id            String @id @default(cuid())
+  applicationId String @unique
+  days          String
+  hours         String
+  preferredCity String
+
+  application DriverApplication @relation(fields: [applicationId], references: [id])
+}
+
+model DriverLocation {
+  id          String   @id @default(cuid())
+  driverId    String   @unique
+  lat         Float
+  lng         Float
+  isAvailable Boolean  @default(true)
+  updatedAt   DateTime @updatedAt
+
+  driver User @relation(fields: [driverId], references: [id])
+}
