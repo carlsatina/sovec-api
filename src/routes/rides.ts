@@ -3,6 +3,7 @@ import { z } from 'zod'
 import prisma from '../db'
 import { getIo } from '../socket'
 import { clearAssignmentTimeout, reassignRide } from '../services/ride-assignment'
+import { getAuthContext, requireAuth } from '../lib/auth'
 
 const router = Router()
 
@@ -119,9 +120,9 @@ router.post('/:id/decline', async (req, res) => {
   res.json({ ok: true })
 })
 
-router.post('/:id/rate', async (req, res) => {
+router.post('/:id/rate', requireAuth, async (req, res) => {
+  const auth = getAuthContext(res)
   const parsed = z.object({
-    riderId: z.string(),
     rating: z.number().int().min(1).max(5),
     comment: z.string().max(300).optional(),
     tags: z.array(z.string().min(1).max(50)).max(10).optional()
@@ -135,7 +136,7 @@ router.post('/:id/rate', async (req, res) => {
     select: { id: true, riderId: true, driverId: true, status: true }
   })
   if (!ride) return res.status(404).json({ error: 'Ride not found' })
-  if (ride.riderId !== parsed.data.riderId) return res.status(403).json({ error: 'Only ride rider can submit rating' })
+  if (ride.riderId !== auth.userId) return res.status(403).json({ error: 'Only ride rider can submit rating' })
   if (ride.status !== 'COMPLETED') return res.status(409).json({ error: 'Ride must be completed before rating' })
 
   const existingRating = await prisma.rideEvent.findFirst({
@@ -149,7 +150,7 @@ router.post('/:id/rate', async (req, res) => {
       rideId: ride.id,
       type: 'RATED',
       metadata: {
-        riderId: parsed.data.riderId,
+        riderId: auth.userId,
         driverId: ride.driverId,
         rating: parsed.data.rating,
         comment: parsed.data.comment ?? null,

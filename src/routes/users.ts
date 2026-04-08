@@ -1,16 +1,37 @@
 import { Router } from 'express'
 import prisma from '../db'
+import { getAuthContext, requireAuth } from '../lib/auth'
 
 const router = Router()
 
-// Stub: returns a seeded user based on X-Dev-Role header (DRIVER or PASSENGER).
-// Replace with real JWT-based lookup when proper auth is implemented.
-router.get('/me', async (req, res) => {
-  const devRole = (req.headers['x-dev-role'] as string)?.toUpperCase()
-  const role = devRole === 'DRIVER' ? 'DRIVER' : 'PASSENGER'
-  const user = await prisma.user.findFirst({ where: { role } })
-  if (!user) return res.status(404).json({ error: `No ${role} user found — run npm run prisma:seed` })
-  res.json({ id: user.id, name: user.name, role: user.role })
+router.get('/me', requireAuth, async (_req, res) => {
+  const auth = getAuthContext(res)
+  const user = await prisma.user.findUnique({
+    where: { id: auth.userId },
+    select: { id: true, name: true, role: true }
+  })
+  if (!user) return res.status(404).json({ error: 'User not found' })
+  return res.json(user)
+})
+
+router.get('/me/rides', requireAuth, async (req, res) => {
+  const auth = getAuthContext(res)
+  const parsedLimit = Number(req.query.limit ?? 20)
+  const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, Math.floor(parsedLimit))) : 20
+
+  const where = auth.role === 'DRIVER' ? { driverId: auth.userId } : { riderId: auth.userId }
+
+  const items = await prisma.ride.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    include: {
+      rider: { select: { id: true, name: true, phone: true } },
+      driver: { select: { id: true, name: true, phone: true } }
+    }
+  })
+
+  return res.json({ items })
 })
 
 router.put('/me', (_req, res) => {
