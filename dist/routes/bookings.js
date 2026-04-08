@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import prisma from '../db';
 import { getIo } from '../socket';
+import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment';
 const router = Router();
 const fareEstimateSchema = z.object({
     pickupLat: z.number(),
@@ -31,7 +32,7 @@ router.post('/estimate', (req, res) => {
     });
 });
 const createBookingSchema = z.object({
-    riderId: z.string().optional(),
+    riderId: z.string(),
     pickupAddress: z.string(),
     pickupLat: z.number(),
     pickupLng: z.number(),
@@ -50,45 +51,29 @@ function haversine(lat1, lon1, lat2, lon2) {
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
 }
-async function findNearestDriver(lat, lng) {
-    const locations = await prisma.driverLocation.findMany({
-        where: { isAvailable: true },
-        include: { driver: true }
-    });
-    if (!locations.length)
-        return null;
-    const scored = locations.map((loc) => ({
-        driverId: loc.driverId,
-        distance: haversine(lat, lng, loc.lat, loc.lng)
-    }));
-    scored.sort((a, b) => a.distance - b.distance);
-    return scored[0].driverId;
-}
 router.post('/', async (req, res) => {
     const parsed = createBookingSchema.safeParse(req.body);
     if (!parsed.success) {
         return res.status(422).json({ error: parsed.error.flatten() });
     }
-    const data = parsed.data;
-    const riderId = data.riderId
-        ? data.riderId
-        : (await prisma.user.findFirst({ where: { role: 'PASSENGER' } }))?.id;
-    if (!riderId) {
-        return res.status(404).json({ error: 'No rider found' });
-    }
+    const { riderId, pickupAddress, pickupLat, pickupLng, dropoffAddress, dropoffLat, dropoffLng, paymentMethod } = parsed.data;
+    // Calculate fare using the same logic as /estimate
+    const distanceKm = haversine(pickupLat, pickupLng, dropoffLat, dropoffLng);
+    const durationMin = Math.max(4, (distanceKm / 22) * 60);
+    const fareAmount = 55 + Math.round(distanceKm * 15) + Math.round(durationMin * 2.8);
     const ride = await prisma.ride.create({
         data: {
             riderId,
             status: 'FINDING_DRIVER',
-            pickupAddress: data.pickupAddress,
-            pickupLat: data.pickupLat,
-            pickupLng: data.pickupLng,
-            dropoffAddress: data.dropoffAddress,
-            dropoffLat: data.dropoffLat,
-            dropoffLng: data.dropoffLng,
-            fareAmount: 286,
+            pickupAddress,
+            pickupLat,
+            pickupLng,
+            dropoffAddress,
+            dropoffLat,
+            dropoffLng,
+            fareAmount,
             currency: 'PHP',
-            paymentMethod: data.paymentMethod,
+            paymentMethod,
             events: {
                 create: [{ type: 'FINDING_DRIVER' }]
             }
@@ -97,28 +82,23 @@ router.post('/', async (req, res) => {
     const io = getIo();
     io.to(`ride:${ride.id}`).emit('ride:status', { rideId: ride.id, status: ride.status });
     io.to(`user:${riderId}`).emit('ride:status', { rideId: ride.id, status: ride.status });
-    const driverId = await findNearestDriver(data.pickupLat, data.pickupLng);
-    if (driverId) {
-        const assigned = await prisma.ride.update({
-            where: { id: ride.id },
-            data: {
-                driverId,
-                status: 'ASSIGNED',
-                events: { create: [{ type: 'ASSIGNED' }] }
-            }
-        });
-        await prisma.driverLocation.update({
-            where: { driverId },
-            data: { isAvailable: false }
-        });
-        io.to(`ride:${ride.id}`).emit('ride:status', { rideId: ride.id, status: assigned.status, driverId });
-        io.to(`user:${riderId}`).emit('ride:status', { rideId: ride.id, status: assigned.status, driverId });
-        io.to(`user:${driverId}`).emit('ride:status', { rideId: ride.id, status: assigned.status, riderId });
+    try {
+        await tryAssignRide(ride.id);
+    }
+    catch {
+        // Driver matching failed — ride stays in FINDING_DRIVER, can be retried
     }
     res.json({ ok: true, rideId: ride.id, status: ride.status });
 });
 router.post('/:id/cancel', async (req, res) => {
     const id = req.params.id;
+    clearAssignmentTimeout(id);
+    const existing = await prisma.ride.findUnique({ where: { id } });
+    if (!existing)
+        return res.status(404).json({ error: 'Ride not found' });
+    if (['CANCELLED', 'COMPLETED'].includes(existing.status)) {
+        return res.status(409).json({ error: `Ride is already ${existing.status.toLowerCase()}` });
+    }
     const ride = await prisma.ride.update({
         where: { id },
         data: {

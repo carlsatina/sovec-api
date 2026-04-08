@@ -22,7 +22,8 @@ export function initSocket(server: HttpServer) {
 
     // Driver location broadcast — passengers on the ride see live movement
     socket.on('driver:location_update', ({ rideId, lat, lng }: { rideId?: string; lat: number; lng: number }) => {
-      if (rideId) io.to(`ride:${rideId}`).emit('driver:location', { lat, lng })
+      if (!io || !rideId) return
+      io.to(`ride:${rideId}`).emit('driver:location', { lat, lng })
     })
   })
 

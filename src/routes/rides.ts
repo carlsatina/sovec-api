@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import prisma from '../db'
 import { getIo } from '../socket'
+import { clearAssignmentTimeout, reassignRide } from '../services/ride-assignment'
 
 const router = Router()
 
@@ -12,7 +13,14 @@ router.get('/driver/:driverId/active', async (req, res) => {
       driverId: req.params.driverId,
       status: { in: ['ASSIGNED', 'ARRIVING', 'IN_PROGRESS'] }
     },
-    orderBy: { createdAt: 'desc' }
+    orderBy: { createdAt: 'desc' },
+    include: {
+      rider: { select: { id: true, name: true, phone: true } },
+      events: {
+        orderBy: { createdAt: 'desc' },
+        take: 20
+      }
+    }
   })
   res.json({ ride: ride ?? null })
 })
@@ -24,20 +32,50 @@ router.get('/:id', async (req, res) => {
 })
 
 const VALID_STATUSES = ['FINDING_DRIVER', 'ASSIGNED', 'ARRIVING', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'] as const
+const DRIVER_CONTROLLED_STATUSES = new Set(['ARRIVING', 'IN_PROGRESS', 'COMPLETED'])
+const NEXT_STATUSES: Record<string, Array<(typeof VALID_STATUSES)[number]>> = {
+  REQUESTED: ['FINDING_DRIVER', 'CANCELLED'],
+  FINDING_DRIVER: ['ASSIGNED', 'CANCELLED'],
+  ASSIGNED: ['ARRIVING', 'CANCELLED', 'FINDING_DRIVER'],
+  ARRIVING: ['IN_PROGRESS', 'CANCELLED'],
+  IN_PROGRESS: ['COMPLETED', 'CANCELLED'],
+  COMPLETED: [],
+  CANCELLED: []
+}
 
 router.post('/:id/status', async (req, res) => {
-  const parsed = z.object({ status: z.enum(VALID_STATUSES) }).safeParse(req.body)
+  const parsed = z.object({ status: z.enum(VALID_STATUSES), driverId: z.string().optional() }).safeParse(req.body)
   if (!parsed.success) {
     return res.status(422).json({ error: parsed.error.flatten() })
   }
 
-  const ride = await prisma.ride.update({
+  const existing = await prisma.ride.findUnique({
     where: { id: req.params.id },
+    select: { id: true, status: true, driverId: true, riderId: true }
+  })
+  if (!existing) return res.status(404).json({ error: 'Ride not found' })
+
+  if (!NEXT_STATUSES[existing.status]?.includes(parsed.data.status)) {
+    return res.status(409).json({ error: `Invalid transition from ${existing.status} to ${parsed.data.status}` })
+  }
+
+  if (DRIVER_CONTROLLED_STATUSES.has(parsed.data.status)) {
+    if (!parsed.data.driverId || parsed.data.driverId !== existing.driverId) {
+      return res.status(403).json({ error: 'Only assigned driver can update this status' })
+    }
+  }
+
+  const ride = await prisma.ride.update({
+    where: { id: existing.id },
     data: {
       status: parsed.data.status,
       events: { create: [{ type: parsed.data.status }] }
     }
   })
+
+  if (['ARRIVING', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'].includes(parsed.data.status)) {
+    clearAssignmentTimeout(ride.id)
+  }
 
   if ((parsed.data.status === 'COMPLETED' || parsed.data.status === 'CANCELLED') && ride.driverId) {
     await prisma.driverLocation.update({
@@ -50,6 +88,77 @@ router.post('/:id/status', async (req, res) => {
   io.to(`ride:${ride.id}`).emit('ride:status', { rideId: ride.id, status: ride.status })
 
   res.json({ id: ride.id, status: ride.status })
+})
+
+router.post('/:id/decline', async (req, res) => {
+  const parsed = z.object({ driverId: z.string() }).safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(422).json({ error: parsed.error.flatten() })
+  }
+
+  const existing = await prisma.ride.findUnique({
+    where: { id: req.params.id },
+    select: { id: true, status: true, driverId: true }
+  })
+  if (!existing) return res.status(404).json({ error: 'Ride not found' })
+  if (existing.status !== 'ASSIGNED') {
+    return res.status(409).json({ error: 'Only assigned rides can be declined' })
+  }
+  if (existing.driverId !== parsed.data.driverId) {
+    return res.status(403).json({ error: 'Only assigned driver can decline this ride' })
+  }
+
+  await prisma.ride.update({
+    where: { id: existing.id },
+    data: {
+      events: { create: [{ type: 'DRIVER_DECLINED', metadata: { driverId: parsed.data.driverId } }] }
+    }
+  })
+
+  await reassignRide(existing.id, [parsed.data.driverId])
+  res.json({ ok: true })
+})
+
+router.post('/:id/rate', async (req, res) => {
+  const parsed = z.object({
+    riderId: z.string(),
+    rating: z.number().int().min(1).max(5),
+    comment: z.string().max(300).optional(),
+    tags: z.array(z.string().min(1).max(50)).max(10).optional()
+  }).safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(422).json({ error: parsed.error.flatten() })
+  }
+
+  const ride = await prisma.ride.findUnique({
+    where: { id: req.params.id },
+    select: { id: true, riderId: true, driverId: true, status: true }
+  })
+  if (!ride) return res.status(404).json({ error: 'Ride not found' })
+  if (ride.riderId !== parsed.data.riderId) return res.status(403).json({ error: 'Only ride rider can submit rating' })
+  if (ride.status !== 'COMPLETED') return res.status(409).json({ error: 'Ride must be completed before rating' })
+
+  const existingRating = await prisma.rideEvent.findFirst({
+    where: { rideId: ride.id, type: 'RATED' },
+    select: { id: true }
+  })
+  if (existingRating) return res.status(409).json({ error: 'Rating already submitted for this ride' })
+
+  const event = await prisma.rideEvent.create({
+    data: {
+      rideId: ride.id,
+      type: 'RATED',
+      metadata: {
+        riderId: parsed.data.riderId,
+        driverId: ride.driverId,
+        rating: parsed.data.rating,
+        comment: parsed.data.comment ?? null,
+        tags: parsed.data.tags ?? []
+      }
+    }
+  })
+
+  return res.json({ ok: true, id: event.id })
 })
 
 router.post('/:id/events', async (req, res) => {
