@@ -22,6 +22,7 @@ async function triggerVerifyLock(app: ReturnType<typeof createTestApp>, phone: s
 }
 
 test.beforeEach(() => {
+  process.env.SMS_PROVIDER = 'mock'
   resetAuthStateForTests()
 })
 

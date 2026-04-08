@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from 'express'
 import jwt from 'jsonwebtoken'
+import { normalizePhoneForIdentity } from './phone'
 
 export type AuthContext = {
   userId: string
@@ -46,22 +47,26 @@ function getJwtSecret() {
   return DEV_JWT_SECRET
 }
 
-function normalizePhone(phone: string) {
-  return phone.trim()
-}
-
 export function createOtp(phone: string) {
-  const normalizedPhone = normalizePhone(phone)
+  const normalizedPhone = normalizePhoneForIdentity(phone)
   const code = String(Math.floor(100000 + Math.random() * 900000))
   const expiresAt = Date.now() + OTP_TTL_MS
   otpSessions.set(normalizedPhone, { code, expiresAt })
   return { phone: normalizedPhone, code, expiresAt }
 }
 
+export function clearOtp(phone: string) {
+  otpSessions.delete(normalizePhoneForIdentity(phone))
+}
+
+function getSendRateLimitKeys(phone: string, ip?: string) {
+  const normalizedPhone = normalizePhoneForIdentity(phone)
+  return [`phone:${normalizedPhone}`, ip ? `ip:${ip}` : null].filter(Boolean) as string[]
+}
+
 export function checkOtpSendRateLimit(phone: string, ip?: string) {
   const now = Date.now()
-  const normalizedPhone = normalizePhone(phone)
-  const keys = [`phone:${normalizedPhone}`, ip ? `ip:${ip}` : null].filter(Boolean) as string[]
+  const keys = getSendRateLimitKeys(phone, ip)
 
   for (const key of keys) {
     const current = otpSendCounters.get(key)
@@ -76,6 +81,12 @@ export function checkOtpSendRateLimit(phone: string, ip?: string) {
     }
   }
 
+  return { ok: true as const }
+}
+
+export function recordOtpSendAttempt(phone: string, ip?: string) {
+  const now = Date.now()
+  const keys = getSendRateLimitKeys(phone, ip)
   for (const key of keys) {
     const current = otpSendCounters.get(key)
     if (!current || now - current.windowStartedAt >= OTP_SEND_WINDOW_MS) {
@@ -85,13 +96,11 @@ export function checkOtpSendRateLimit(phone: string, ip?: string) {
       otpSendCounters.set(key, current)
     }
   }
-
-  return { ok: true as const }
 }
 
 export function checkOtpVerifyRateLimit(phone: string) {
   const now = Date.now()
-  const normalizedPhone = normalizePhone(phone)
+  const normalizedPhone = normalizePhoneForIdentity(phone)
   const state = otpVerifyStates.get(normalizedPhone)
   if (!state) {
     return { ok: true as const }
@@ -110,7 +119,13 @@ export function checkOtpVerifyRateLimit(phone: string) {
 }
 
 export function verifyOtpCode(phone: string, code: string): OtpVerifyResult {
-  const normalizedPhone = normalizePhone(phone)
+  const normalizedPhone = normalizePhoneForIdentity(phone)
+  if (process.env.NODE_ENV !== 'production' && code.trim() === '123456') {
+    otpSessions.delete(normalizedPhone)
+    otpVerifyStates.delete(normalizedPhone)
+    return { ok: true, phone: normalizedPhone }
+  }
+
   const session = otpSessions.get(normalizedPhone)
   if (!session) return { ok: false, reason: 'OTP not requested for this phone number' as const }
   if (Date.now() > session.expiresAt) {
@@ -118,12 +133,6 @@ export function verifyOtpCode(phone: string, code: string): OtpVerifyResult {
     return { ok: false, reason: 'OTP expired. Please request a new code' as const }
   }
   if (session.code !== code.trim()) {
-    if (process.env.NODE_ENV !== 'production' && code.trim() === '123456') {
-      otpSessions.delete(normalizedPhone)
-      otpVerifyStates.delete(normalizedPhone)
-      return { ok: true, phone: normalizedPhone }
-    }
-
     const now = Date.now()
     const current = otpVerifyStates.get(normalizedPhone) ?? { failedAttempts: 0, lockedUntil: 0 }
     const failedAttempts = current.failedAttempts + 1

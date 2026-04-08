@@ -30,7 +30,13 @@ cp .env.example .env
 3. Update `.env` values:
 - `DATABASE_URL`
 - `PORT` (default `4000`)
+- `JWT_SECRET` (required in production)
 - `GOOGLE_MAPS_API_KEY`
+- `SMS_PROVIDER` (`mock` or `semaphore`)
+- If using Semaphore:
+  - `SEMAPHORE_API_KEY`
+  - `SEMAPHORE_SENDER_NAME` (optional)
+  - `SEMAPHORE_OTP_MESSAGE` (optional, supports `{otp}` placeholder)
 
 ## Database Workflow
 ```bash
@@ -51,9 +57,30 @@ npm run build
 npm start
 ```
 
+## API Smoke Test
+Use this to validate the auth flow end-to-end:
+- `POST /auth/otp/send`
+- `POST /auth/otp/verify`
+- `GET /users/me`
+- `GET /users/me/rides`
+
+Run:
+```bash
+SMOKE_PHONE=+639171111111 npm run smoke:auth
+```
+
+Notes:
+- For `SMS_PROVIDER=mock`, the script auto-uses `debugCode`.
+- For real SMS providers, pass the received OTP:
+```bash
+SMOKE_PHONE=+639171111111 SMOKE_OTP_CODE=123456 npm run smoke:auth
+```
+- Optional: `API_URL=http://localhost:4000` (defaults to this value).
+
 Health check endpoint:
 - `GET /health` -> `{ "ok": true }`
 
 ## Notes
-- No automated test runner is configured yet; use `npm run build` plus manual API verification.
+- Automated tests are available via `npm test`.
+- OTP SMS delivery uses `SMS_PROVIDER=mock` locally and should be set to `semaphore` in production.
 - Do not edit `dist/` directly; it is generated from `src/`.
