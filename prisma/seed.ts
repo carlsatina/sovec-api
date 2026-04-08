@@ -48,14 +48,69 @@ async function main() {
   })
 
   await prisma.vehicle.upsert({
-    where: { driverId: driver.id },
-    update: {},
+    where: { plateNumber: 'ABC-1234' },
+    update: {
+      driverId: driver.id,
+      model: 'Toyota bZ4X',
+      capacity: 4,
+      color: 'Pearl White',
+      status: 'AVAILABLE',
+      batteryCapacityKwh: 71.4,
+      batteryLevel: 78
+    },
     create: {
       driverId: driver.id,
       plateNumber: 'ABC-1234',
       model: 'Toyota bZ4X',
       capacity: 4,
-      color: 'Pearl White'
+      color: 'Pearl White',
+      status: 'AVAILABLE',
+      batteryCapacityKwh: 71.4,
+      batteryLevel: 78
+    }
+  })
+
+  await prisma.vehicle.upsert({
+    where: { plateNumber: 'EV-2401' },
+    update: {
+      model: 'BYD Dolphin',
+      capacity: 4,
+      color: 'Blue',
+      status: 'CHARGING',
+      batteryCapacityKwh: 44.9,
+      batteryLevel: 32,
+      driverId: null
+    },
+    create: {
+      plateNumber: 'EV-2401',
+      model: 'BYD Dolphin',
+      capacity: 4,
+      color: 'Blue',
+      status: 'CHARGING',
+      batteryCapacityKwh: 44.9,
+      batteryLevel: 32
+    }
+  })
+
+  await prisma.vehicle.upsert({
+    where: { plateNumber: 'EV-2402' },
+    update: {
+      model: 'Nissan Leaf',
+      capacity: 4,
+      color: 'Silver',
+      status: 'MAINTENANCE',
+      batteryCapacityKwh: 40,
+      batteryLevel: 55,
+      driverId: null
+    },
+    create: {
+      plateNumber: 'EV-2402',
+      model: 'Nissan Leaf',
+      capacity: 4,
+      color: 'Silver',
+      status: 'MAINTENANCE',
+      batteryCapacityKwh: 40,
+      batteryLevel: 55
     }
   })
 

@@ -125,5 +125,26 @@ Health check endpoint:
   - Validation:
     - all rates must be non-negative
     - `minimumFare >= baseFare`
+- `GET /admin/vehicles`
+  - Query params:
+    - `status`: `AVAILABLE | IN_USE | CHARGING | MAINTENANCE`
+    - `q`: search on plate/model/color/driver name/phone
+    - `page`: default `1`
+    - `limit`: default `20`, max `100`
+- `POST /admin/vehicles`
+  - Body: `{ plateNumber, model, capacity, color?, status?, batteryCapacityKwh?, batteryLevel?, driverId? }`
+- `POST /admin/vehicles/:id/assign-driver`
+  - Body: `{ driverId? }`
+  - Use `null`/empty to unassign vehicle driver
+- `POST /admin/vehicles/:id/status`
+  - Body: `{ status, batteryLevel? }`
 
 Fare computation (`/bookings/estimate` and booking creation) now uses the persisted admin pricing config.
+
+## Smoke Tests
+- Auth smoke test:
+  - `SMOKE_PHONE=+639171111111 npm run smoke:auth`
+- Admin fleet smoke test:
+  - `ADMIN_TOKEN=<admin-jwt> npm run smoke:admin:fleet`
+  - Optional assignment check:
+    - `SMOKE_DRIVER_ID=<driver-user-id> ADMIN_TOKEN=<admin-jwt> npm run smoke:admin:fleet`

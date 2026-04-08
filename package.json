@@ -8,6 +8,7 @@
     "build": "tsc",
     "test": "node --import tsx --test src/**/*.test.ts",
     "smoke:auth": "node scripts/smoke-auth.mjs",
+    "smoke:admin:fleet": "node scripts/smoke-admin-fleet.mjs",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",

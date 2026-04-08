@@ -38,6 +38,13 @@ enum ApplicationStatus {
   REJECTED
 }
 
+enum VehicleStatus {
+  AVAILABLE
+  IN_USE
+  CHARGING
+  MAINTENANCE
+}
+
 model User {
   id        String   @id @default(cuid())
   name      String
@@ -116,14 +123,19 @@ model RideEvent {
 }
 
 model Vehicle {
-  id          String @id @default(cuid())
-  driverId    String @unique
-  plateNumber String
-  model       String
-  capacity    Int
-  color       String?
+  id                 String        @id @default(cuid())
+  driverId           String?       @unique
+  plateNumber        String        @unique
+  model              String
+  capacity           Int
+  color              String?
+  status             VehicleStatus @default(AVAILABLE)
+  batteryCapacityKwh Float?
+  batteryLevel       Int?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
 
-  driver User @relation(fields: [driverId], references: [id])
+  driver User? @relation(fields: [driverId], references: [id])
 }
 
 model Payment {
