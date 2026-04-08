@@ -34,6 +34,19 @@ async function main() {
     }
   })
 
+  await prisma.user.upsert({
+    where: { phone: '+639179999999' },
+    update: {
+      role: 'ADMIN'
+    },
+    create: {
+      name: 'Admin User',
+      phone: '+639179999999',
+      email: 'admin@example.com',
+      role: 'ADMIN'
+    }
+  })
+
   await prisma.vehicle.upsert({
     where: { driverId: driver.id },
     update: {},
@@ -126,6 +139,19 @@ async function main() {
           preferredCity: 'Taguig'
         }
       }
+    }
+  })
+
+  await prisma.fareConfig.upsert({
+    where: { id: 'default' },
+    update: {},
+    create: {
+      id: 'default',
+      baseFare: 55,
+      perKmRate: 15,
+      perMinuteRate: 2.8,
+      minimumFare: 55,
+      currency: 'PHP'
     }
   })
 }

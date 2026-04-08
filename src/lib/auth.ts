@@ -197,6 +197,16 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  return requireAuth(req, res, () => {
+    const auth = res.locals.auth as AuthContext | undefined
+    if (!auth || auth.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Admin access required' })
+    }
+    return next()
+  })
+}
+
 export function getAuthContext(res: Response): AuthContext {
   const auth = res.locals.auth as AuthContext | undefined
   if (!auth) {

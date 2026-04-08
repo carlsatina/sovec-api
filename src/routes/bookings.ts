@@ -3,6 +3,7 @@ import { z } from 'zod'
 import prisma from '../db'
 import { getIo } from '../socket'
 import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment'
+import { calculateFare } from '../services/fare-config'
 
 const router = Router()
 
@@ -13,29 +14,16 @@ const fareEstimateSchema = z.object({
   dropoffLng: z.number()
 })
 
-router.post('/estimate', (req, res) => {
+router.post('/estimate', async (req, res) => {
   const parsed = fareEstimateSchema.safeParse(req.body)
   if (!parsed.success) {
     return res.status(422).json({ error: parsed.error.flatten() })
   }
 
   const { pickupLat, pickupLng, dropoffLat, dropoffLng } = parsed.data
-  const distanceKm = haversine(pickupLat, pickupLng, dropoffLat, dropoffLng)
-  const durationMin = Math.max(4, (distanceKm / 22) * 60)
+  const fare = await calculateFare(pickupLat, pickupLng, dropoffLat, dropoffLng)
 
-  const breakdown = {
-    base: 55,
-    distance: Math.round(distanceKm * 15),
-    time: Math.round(durationMin * 2.8)
-  }
-
-  res.json({
-    currency: 'PHP',
-    total: breakdown.base + breakdown.distance + breakdown.time,
-    distanceKm: Number(distanceKm.toFixed(2)),
-    durationMin: Math.round(durationMin),
-    breakdown
-  })
+  res.json(fare)
 })
 
 const createBookingSchema = z.object({
@@ -49,18 +37,6 @@ const createBookingSchema = z.object({
   paymentMethod: z.enum(['CASH', 'EWALLET', 'CARD'])
 })
 
-function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
-  const toRad = (v: number) => (v * Math.PI) / 180
-  const R = 6371
-  const dLat = toRad(lat2 - lat1)
-  const dLon = toRad(lon2 - lon1)
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2)
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-  return R * c
-}
-
 router.post('/', async (req, res) => {
   const parsed = createBookingSchema.safeParse(req.body)
   if (!parsed.success) {
@@ -69,10 +45,8 @@ router.post('/', async (req, res) => {
 
   const { riderId, pickupAddress, pickupLat, pickupLng, dropoffAddress, dropoffLat, dropoffLng, paymentMethod } = parsed.data
 
-  // Calculate fare using the same logic as /estimate
-  const distanceKm = haversine(pickupLat, pickupLng, dropoffLat, dropoffLng)
-  const durationMin = Math.max(4, (distanceKm / 22) * 60)
-  const fareAmount = 55 + Math.round(distanceKm * 15) + Math.round(durationMin * 2.8)
+  const fare = await calculateFare(pickupLat, pickupLng, dropoffLat, dropoffLng)
+  const fareAmount = fare.total
 
   const ride = await prisma.ride.create({
     data: {
@@ -85,7 +59,7 @@ router.post('/', async (req, res) => {
       dropoffLat,
       dropoffLng,
       fareAmount,
-      currency: 'PHP',
+      currency: fare.currency,
       paymentMethod,
       events: {
         create: [{ type: 'FINDING_DRIVER' }]

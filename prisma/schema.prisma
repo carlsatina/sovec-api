@@ -233,3 +233,13 @@ model DriverLocation {
 
   driver User @relation(fields: [driverId], references: [id])
 }
+
+model FareConfig {
+  id            String   @id @default("default")
+  baseFare      Float    @default(55)
+  perKmRate     Float    @default(15)
+  perMinuteRate Float    @default(2.8)
+  minimumFare   Float    @default(55)
+  currency      String   @default("PHP")
+  updatedAt     DateTime @updatedAt
+}
