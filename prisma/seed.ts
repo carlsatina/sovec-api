@@ -34,6 +34,32 @@ async function main() {
     }
   })
 
+  const driver2 = await prisma.user.upsert({
+    where: { phone: '+639173333333' },
+    update: {
+      role: 'DRIVER'
+    },
+    create: {
+      name: 'Carlo Reyes',
+      phone: '+639173333333',
+      email: 'carlo.reyes@example.com',
+      role: 'DRIVER'
+    }
+  })
+
+  const driver3 = await prisma.user.upsert({
+    where: { phone: '+639174444444' },
+    update: {
+      role: 'DRIVER'
+    },
+    create: {
+      name: 'Miguel Santos',
+      phone: '+639174444444',
+      email: 'miguel.santos@example.com',
+      role: 'DRIVER'
+    }
+  })
+
   await prisma.user.upsert({
     where: { phone: '+639179999999' },
     update: {
@@ -121,6 +147,28 @@ async function main() {
       driverId: driver.id,
       lat: 14.5537,
       lng: 121.0250,
+      isAvailable: true
+    }
+  })
+
+  await prisma.driverLocation.upsert({
+    where: { driverId: driver2.id },
+    update: { lat: 14.5608, lng: 121.0179, isAvailable: true },
+    create: {
+      driverId: driver2.id,
+      lat: 14.5608,
+      lng: 121.0179,
+      isAvailable: true
+    }
+  })
+
+  await prisma.driverLocation.upsert({
+    where: { driverId: driver3.id },
+    update: { lat: 14.5451, lng: 121.0395, isAvailable: true },
+    create: {
+      driverId: driver3.id,
+      lat: 14.5451,
+      lng: 121.0395,
       isAvailable: true
     }
   })
