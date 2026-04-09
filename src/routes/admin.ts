@@ -1,11 +1,11 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import prisma from '../db'
+import prisma from '../db.js'
 import { Prisma } from '@prisma/client'
-import { getAuthContext, requireAdmin } from '../lib/auth'
-import { ADMIN_TARGET_STATUSES, appendAdminStatusNote, canTransitionApplicationStatus } from '../lib/admin-driver-applications'
-import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment'
-import { getIo } from '../socket'
+import { getAuthContext, requireAdmin } from '../lib/auth.js'
+import { ADMIN_TARGET_STATUSES, appendAdminStatusNote, canTransitionApplicationStatus } from '../lib/admin-driver-applications.js'
+import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment.js'
+import { getIo } from '../socket.js'
 
 const router = Router()
 router.use(requireAdmin)

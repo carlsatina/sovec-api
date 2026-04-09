@@ -1,7 +1,7 @@
 import { createServer } from 'http'
-import app from './app'
-import { initSocket } from './socket'
-import { bootstrapAssignmentTimeouts } from './services/ride-assignment'
+import app from './app.js'
+import { initSocket } from './socket.js'
+import { bootstrapAssignmentTimeouts } from './services/ride-assignment.js'
 
 const port = process.env.PORT ? Number(process.env.PORT) : 4000
 const host = process.env.HOST ?? '0.0.0.0'

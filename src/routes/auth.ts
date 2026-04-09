@@ -1,9 +1,9 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import prisma from '../db'
-import { checkOtpSendRateLimit, checkOtpVerifyRateLimit, clearOtp, createOtp, recordOtpSendAttempt, signAuthToken, verifyOtpCode } from '../lib/auth'
-import { isRealSmsProviderConfigured, sendOtpSms } from '../services/sms'
-import { normalizePhoneForIdentity } from '../lib/phone'
+import prisma from '../db.js'
+import { checkOtpSendRateLimit, checkOtpVerifyRateLimit, clearOtp, createOtp, recordOtpSendAttempt, signAuthToken, verifyOtpCode } from '../lib/auth.js'
+import { isRealSmsProviderConfigured, sendOtpSms } from '../services/sms.js'
+import { normalizePhoneForIdentity } from '../lib/phone.js'
 
 const router = Router()
 

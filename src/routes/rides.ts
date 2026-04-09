@@ -1,9 +1,9 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import prisma from '../db'
-import { getIo } from '../socket'
-import { clearAssignmentTimeout, reassignRide } from '../services/ride-assignment'
-import { getAuthContext, requireAuth } from '../lib/auth'
+import prisma from '../db.js'
+import { getIo } from '../socket.js'
+import { clearAssignmentTimeout, reassignRide } from '../services/ride-assignment.js'
+import { getAuthContext, requireAuth } from '../lib/auth.js'
 
 const router = Router()
 

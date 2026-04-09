@@ -1,4 +1,4 @@
-import { toSemaphoreNumber } from '../lib/phone'
+import { toSemaphoreNumber } from '../lib/phone.js'
 
 type SmsProvider = 'mock' | 'semaphore'
 

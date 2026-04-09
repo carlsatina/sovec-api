@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express'
 import jwt from 'jsonwebtoken'
-import { normalizePhoneForIdentity } from './phone'
+import { normalizePhoneForIdentity } from './phone.js'
 
 export type AuthContext = {
   userId: string

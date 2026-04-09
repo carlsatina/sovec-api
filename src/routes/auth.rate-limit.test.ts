@@ -2,8 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import express from 'express'
 import request from 'supertest'
-import authRoutes from './auth'
-import { resetAuthStateForTests } from '../lib/auth'
+import authRoutes from './auth.js'
+import { resetAuthStateForTests } from '../lib/auth.js'
 
 function createTestApp() {
   const app = express()

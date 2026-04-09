@@ -1,9 +1,9 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import prisma from '../db'
-import { getIo } from '../socket'
-import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment'
-import { calculateFare } from '../services/fare-config'
+import prisma from '../db.js'
+import { getIo } from '../socket.js'
+import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment.js'
+import { calculateFare } from '../services/fare-config.js'
 
 const router = Router()
 

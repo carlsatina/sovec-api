@@ -2,9 +2,9 @@ import test, { afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import express from 'express'
 import request from 'supertest'
-import adminRoutes from './admin'
-import { signAuthToken } from '../lib/auth'
-import prisma from '../db'
+import adminRoutes from './admin.js'
+import { signAuthToken } from '../lib/auth.js'
+import prisma from '../db.js'
 
 function createTestApp() {
   const app = express()

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { appendAdminStatusNote, canTransitionApplicationStatus } from './admin-driver-applications'
+import { appendAdminStatusNote, canTransitionApplicationStatus } from './admin-driver-applications.js'
 
 test('canTransitionApplicationStatus enforces workflow', () => {
   assert.equal(canTransitionApplicationStatus('SUBMITTED', 'UNDER_REVIEW'), true)

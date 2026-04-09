@@ -1,5 +1,5 @@
-import prisma from '../db'
-import { getIo } from '../socket'
+import prisma from '../db.js'
+import { getIo } from '../socket.js'
 
 const ASSIGNMENT_TIMEOUT_MS = 30_000
 const assignmentTimers = new Map<string, ReturnType<typeof setTimeout>>()

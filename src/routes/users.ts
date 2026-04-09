@@ -1,6 +1,6 @@
 import { Router } from 'express'
-import prisma from '../db'
-import { getAuthContext, requireAuth } from '../lib/auth'
+import prisma from '../db.js'
+import { getAuthContext, requireAuth } from '../lib/auth.js'
 
 const router = Router()
 
