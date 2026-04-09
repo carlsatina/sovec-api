@@ -27,7 +27,24 @@ router.get('/driver/:driverId/active', async (req, res) => {
 })
 
 router.get('/:id', async (req, res) => {
-  const ride = await prisma.ride.findUnique({ where: { id: req.params.id } })
+  const ride = await prisma.ride.findUnique({
+    where: { id: req.params.id },
+    include: {
+      driver: {
+        select: {
+          id: true,
+          name: true,
+          phone: true,
+          vehicle: {
+            select: {
+              model: true,
+              plateNumber: true
+            }
+          }
+        }
+      }
+    }
+  })
   if (!ride) return res.status(404).json({ error: 'Ride not found' })
   res.json(ride)
 })
