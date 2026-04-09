@@ -104,6 +104,10 @@ router.post('/:id/status', async (req, res) => {
 
   const io = getIo()
   io.to(`ride:${ride.id}`).emit('ride:status', { rideId: ride.id, status: ride.status })
+  io.to(`user:${existing.riderId}`).emit('ride:status', { rideId: ride.id, status: ride.status })
+  if (existing.driverId) {
+    io.to(`user:${existing.driverId}`).emit('ride:status', { rideId: ride.id, status: ride.status, riderId: existing.riderId })
+  }
 
   res.json({ id: ride.id, status: ride.status })
 })
