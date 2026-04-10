@@ -65,6 +65,7 @@ model User {
   driverApplication DriverApplication?
   vehicle           Vehicle?
   driverLocation    DriverLocation?
+  adminAuditLogs    AdminAuditLog[]
 }
 
 model Profile {
@@ -279,4 +280,23 @@ model SafetyDeliveryLog {
 
   @@index([incidentId, createdAt])
   @@index([status, createdAt])
+}
+
+model AdminAuditLog {
+  id         String   @id @default(cuid())
+  adminId    String
+  action     String
+  targetType String
+  targetId   String?
+  summary    String?
+  before     Json?
+  after      Json?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  admin User @relation(fields: [adminId], references: [id])
+
+  @@index([adminId, createdAt])
+  @@index([action, createdAt])
+  @@index([targetType, createdAt])
 }

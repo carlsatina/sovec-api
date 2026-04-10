@@ -15,6 +15,7 @@ const ACTIVE_RIDE_STATUSES = ['REQUESTED', 'FINDING_DRIVER', 'ASSIGNED', 'ARRIVI
 const REASSIGNABLE_RIDE_STATUSES = ['REQUESTED', 'FINDING_DRIVER', 'ASSIGNED', 'ARRIVING'] as const
 const CANCELLABLE_RIDE_STATUSES = ['REQUESTED', 'FINDING_DRIVER', 'ASSIGNED', 'ARRIVING', 'IN_PROGRESS'] as const
 const VEHICLE_STATUSES = ['AVAILABLE', 'IN_USE', 'CHARGING', 'MAINTENANCE'] as const
+const FLEET_HISTORY_ACTIONS = ['FLEET_CREATE_VEHICLE', 'FLEET_ASSIGN_DRIVER', 'FLEET_UPDATE_STATUS'] as const
 const PAYMENT_STATUSES = ['PENDING', 'PAID', 'VERIFIED', 'FAILED', 'REFUND_PENDING', 'REFUNDED'] as const
 const PAYMENT_METHODS = ['CASH', 'EWALLET', 'CARD'] as const
 const SUPPORT_TICKET_STATUSES = ['OPEN', 'IN_REVIEW', 'RESOLVED', 'CLOSED'] as const
@@ -52,6 +53,16 @@ function dayKey(date: Date) {
   const month = String(date.getMonth() + 1).padStart(2, '0')
   const day = String(date.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
+}
+
+function isAllowedVehicleStatusTransition(current: (typeof VEHICLE_STATUSES)[number], next: (typeof VEHICLE_STATUSES)[number]) {
+  const allowed: Record<(typeof VEHICLE_STATUSES)[number], ReadonlyArray<(typeof VEHICLE_STATUSES)[number]>> = {
+    AVAILABLE: ['AVAILABLE', 'IN_USE', 'CHARGING', 'MAINTENANCE'],
+    IN_USE: ['IN_USE', 'AVAILABLE'],
+    CHARGING: ['CHARGING', 'AVAILABLE'],
+    MAINTENANCE: ['MAINTENANCE', 'AVAILABLE']
+  }
+  return allowed[current].includes(next)
 }
 
 type SafetyIncidentMeta = {
@@ -137,6 +148,39 @@ async function appendSafetyTimelineEvent(input: {
       }
     }
   }).catch(() => null)
+}
+
+async function recordAdminAudit(input: {
+  adminId: string
+  action: string
+  targetType: string
+  targetId?: string | null
+  summary?: string
+  before?: Prisma.JsonValue
+  after?: Prisma.JsonValue
+  metadata?: Prisma.JsonValue
+}) {
+  const repo = (prisma as any).adminAuditLog
+  if (!repo?.create) return
+  await repo.create({
+    data: {
+      adminId: input.adminId,
+      action: input.action,
+      targetType: input.targetType,
+      targetId: input.targetId ?? null,
+      summary: input.summary ?? null,
+      before: input.before ?? null,
+      after: input.after ?? null,
+      metadata: input.metadata ?? null
+    }
+  }).catch((err: unknown) => {
+    console.error('[admin-audit] failed to persist', {
+      action: input.action,
+      targetType: input.targetType,
+      targetId: input.targetId ?? null,
+      error: err instanceof Error ? err.message : String(err)
+    })
+  })
 }
 
 async function enrichSafetyIncidents(items: Array<{
@@ -325,6 +369,17 @@ router.post('/driver-applications/:id/status', async (req, res) => {
     return updated
   })
 
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'DRIVER_APPLICATION_STATUS_UPDATE',
+    targetType: 'DRIVER_APPLICATION',
+    targetId: existing.id,
+    summary: `Driver application ${existing.id.slice(0, 8)} moved from ${existing.status} to ${application.status}`,
+    before: { status: existing.status },
+    after: { status: application.status },
+    metadata: { reason: parsed.data.reason ?? null }
+  })
+
   res.json({ ok: true, application })
 })
 
@@ -354,6 +409,17 @@ router.post('/driver-applications/:id/interview', async (req, res) => {
         reason: `Interview scheduled for ${parsed.data.interviewAt}`
       })
     }
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'DRIVER_APPLICATION_SCHEDULE_INTERVIEW',
+    targetType: 'DRIVER_APPLICATION',
+    targetId: existing.id,
+    summary: `Driver application ${existing.id.slice(0, 8)} interview scheduled`,
+    before: { status: existing.status, interviewAt: null },
+    after: { status: application.status, interviewAt: application.interviewAt ? application.interviewAt.toISOString() : null },
+    metadata: { scheduledAt: parsed.data.interviewAt }
   })
 
   res.json({ ok: true, application })
@@ -483,6 +549,17 @@ router.post('/rides/:id/force-cancel', async (req, res) => {
     io.to(`user:${existing.driverId}`).emit('ride:status', { rideId: existing.id, status: 'CANCELLED' })
   }
 
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'RIDE_FORCE_CANCEL',
+    targetType: 'RIDE',
+    targetId: existing.id,
+    summary: `Ride ${existing.id.slice(0, 8)} force-cancelled`,
+    before: { status: existing.status, driverId: existing.driverId ?? null },
+    after: { status: 'CANCELLED', driverId: existing.driverId ?? null },
+    metadata: { reason: parsed.data.reason ?? null }
+  })
+
   return res.json({ ok: true, id: existing.id, status: 'CANCELLED' })
 })
 
@@ -604,6 +681,20 @@ router.post('/rides/:id/reassign', async (req, res) => {
       io.to(`user:${existing.riderId}`).emit('ride:status', { rideId: existing.id, status: preferredAssignResult.status, driverId: preferredAssignResult.driverId })
       io.to(`user:${parsed.data.preferredDriverId}`).emit('ride:status', { rideId: existing.id, status: preferredAssignResult.status, riderId: existing.riderId })
 
+      await recordAdminAudit({
+        adminId: auth.userId,
+        action: 'RIDE_REASSIGN',
+        targetType: 'RIDE',
+        targetId: existing.id,
+        summary: `Ride ${existing.id.slice(0, 8)} reassigned`,
+        before: { status: existing.status, driverId: previousDriverId },
+        after: { status: preferredAssignResult.status, driverId: preferredAssignResult.driverId ?? null },
+        metadata: {
+          reason: parsed.data.reason ?? null,
+          preferredDriverId: parsed.data.preferredDriverId ?? null
+        }
+      })
+
       return res.json({ ok: true, id: existing.id, status: preferredAssignResult.status, driverId: preferredAssignResult.driverId })
     }
   }
@@ -615,6 +706,21 @@ router.post('/rides/:id/reassign', async (req, res) => {
     select: { id: true, status: true, driverId: true }
   })
   if (!latest) return res.status(404).json({ error: 'Ride not found after reassign' })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'RIDE_REASSIGN',
+    targetType: 'RIDE',
+    targetId: existing.id,
+    summary: `Ride ${existing.id.slice(0, 8)} reassignment flow triggered`,
+    before: { status: existing.status, driverId: previousDriverId },
+    after: { status: latest.status, driverId: latest.driverId ?? null },
+    metadata: {
+      reason: parsed.data.reason ?? null,
+      preferredDriverId: parsed.data.preferredDriverId ?? null
+    }
+  })
+
   return res.json({ ok: true, id: latest.id, status: latest.status, driverId: latest.driverId ?? null })
 })
 
@@ -712,6 +818,17 @@ router.post('/payments/:id/verify', async (req, res) => {
     return next
   })
 
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'PAYMENT_VERIFY',
+    targetType: 'PAYMENT',
+    targetId: payment.id,
+    summary: `Payment ${payment.id.slice(0, 8)} marked VERIFIED`,
+    before: { status: payment.status },
+    after: { status: updated.status },
+    metadata: { note: parsed.data.note ?? null }
+  })
+
   return res.json({ ok: true, payment: updated })
 })
 
@@ -746,6 +863,17 @@ router.post('/payments/:id/fail', async (req, res) => {
       }
     })
     return next
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'PAYMENT_FAIL',
+    targetType: 'PAYMENT',
+    targetId: payment.id,
+    summary: `Payment ${payment.id.slice(0, 8)} marked FAILED`,
+    before: { status: payment.status },
+    after: { status: updated.status },
+    metadata: { reason: parsed.data.reason ?? null }
   })
 
   return res.json({ ok: true, payment: updated })
@@ -789,6 +917,17 @@ router.post('/payments/:id/refund', async (req, res) => {
       }
     })
     return next
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'PAYMENT_REFUND_REQUEST',
+    targetType: 'PAYMENT',
+    targetId: payment.id,
+    summary: `Refund requested for payment ${payment.id.slice(0, 8)}`,
+    before: { status: payment.status },
+    after: { status: updated.status },
+    metadata: { reason: parsed.data.reason, amount: parsed.data.amount ?? payment.amount }
   })
 
   return res.json({ ok: true, payment: updated })
@@ -876,7 +1015,75 @@ router.post('/support/tickets/:id/status', async (req, res) => {
     return next
   })
 
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SUPPORT_TICKET_STATUS_UPDATE',
+    targetType: 'SUPPORT_TICKET',
+    targetId: ticket.id,
+    summary: `Support ticket ${ticket.id.slice(0, 8)} moved from ${ticket.status} to ${updated.status}`,
+    before: { status: ticket.status },
+    after: { status: updated.status },
+    metadata: { note: parsed.data.note ?? null }
+  })
+
   return res.json({ ok: true, ticket: updated })
+})
+
+router.get('/audit-logs', async (req, res) => {
+  const parsed = z.object({
+    actorId: z.string().trim().min(1).optional(),
+    action: z.string().trim().min(1).max(120).optional(),
+    targetType: z.string().trim().min(1).max(120).optional(),
+    q: z.string().trim().min(1).max(120).optional(),
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20)
+  }).safeParse(req.query)
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
+
+  const where = {
+    ...(parsed.data.actorId ? { adminId: parsed.data.actorId } : {}),
+    ...(parsed.data.action ? { action: parsed.data.action } : {}),
+    ...(parsed.data.targetType ? { targetType: parsed.data.targetType } : {}),
+    ...(parsed.data.q
+      ? {
+        OR: [
+          { id: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { targetId: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { summary: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { action: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { targetType: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { admin: { name: { contains: parsed.data.q, mode: 'insensitive' as const } } },
+          { admin: { phone: { contains: parsed.data.q, mode: 'insensitive' as const } } }
+        ]
+      }
+      : {})
+  }
+
+  const skip = (parsed.data.page - 1) * parsed.data.limit
+  const auditRepo = (prisma as any).adminAuditLog
+  if (!auditRepo?.findMany || !auditRepo?.count) {
+    return res.status(501).json({ error: 'Admin audit log store is not available' })
+  }
+  const [items, total] = await Promise.all([
+    auditRepo.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parsed.data.limit,
+      include: {
+        admin: { select: { id: true, name: true, phone: true, email: true, role: true } }
+      }
+    }),
+    auditRepo.count({ where })
+  ])
+
+  return res.json({
+    items,
+    page: parsed.data.page,
+    limit: parsed.data.limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / parsed.data.limit))
+  })
 })
 
 router.get('/safety/templates', async (_req, res) => {
@@ -904,7 +1111,23 @@ router.put('/safety/templates/:key', async (req, res) => {
     return res.status(422).json({ error: 'At least one of subject or body is required' })
   }
 
+  const auth = getAuthContext(res)
+  const currentTemplates = await getSafetyTemplates()
+  const previous = currentTemplates[keyParsed.data.key]
   const updated = await updateSafetyTemplate(keyParsed.data.key, bodyParsed.data)
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SAFETY_TEMPLATE_UPDATE',
+    targetType: 'SAFETY_TEMPLATE',
+    targetId: keyParsed.data.key,
+    summary: `Safety template ${keyParsed.data.key} updated`,
+    before: previous
+      ? { subject: previous.subject, body: previous.body }
+      : null,
+    after: { subject: updated.subject, body: updated.body }
+  })
+
   return res.json({
     ok: true,
     template: {
@@ -962,7 +1185,12 @@ router.get('/safety/delivery-logs', async (req, res) => {
 })
 
 router.post('/safety/delivery-logs/:id/retry', async (req, res) => {
-  const log = await prisma.safetyDeliveryLog.findUnique({
+  const auth = getAuthContext(res)
+  const safetyDeliveryRepo = (prisma as any).safetyDeliveryLog
+  if (!safetyDeliveryRepo?.findUnique) {
+    return res.status(501).json({ error: 'Safety delivery log store is not available' })
+  }
+  const log = await safetyDeliveryRepo.findUnique({
     where: { id: req.params.id }
   })
   if (!log) return res.status(404).json({ error: 'Delivery log not found' })
@@ -982,6 +1210,21 @@ router.post('/safety/delivery-logs/:id/retry', async (req, res) => {
     channel: log.channel,
     target: log.target,
     payload: log.payload
+  })
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SAFETY_DELIVERY_RETRY',
+    targetType: 'SAFETY_DELIVERY_LOG',
+    targetId: log.id,
+    summary: `Retried ${log.channel} delivery for incident ${log.incidentId.slice(0, 8)}`,
+    before: { status: log.status, attempts: log.attempts },
+    after: { retryOk: retry.ok, attempts: retry.attempts },
+    metadata: {
+      event: log.event,
+      channel: log.channel,
+      target: log.target,
+      error: 'error' in retry ? (retry.error ?? null) : null
+    }
   })
   return res.json({ ok: true, retry })
 })
@@ -1159,6 +1402,21 @@ router.post('/safety/incidents/:id/resolve', async (req, res) => {
       : undefined
   })
 
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SAFETY_RESOLVE',
+    targetType: 'SAFETY_INCIDENT',
+    targetId: incident.id,
+    summary: `Incident ${incident.id.slice(0, 8)} resolved as ${parsed.data.status}`,
+    before: { status: incident.status },
+    after: { status: parsed.data.status },
+    metadata: {
+      action: parsed.data.action,
+      note: parsed.data.note ?? null,
+      deadLetters: delivery.deadLetters ?? 0
+    }
+  })
+
   return res.json({
     ok: true,
     incident: updated,
@@ -1179,7 +1437,7 @@ router.post('/safety/incidents/:id/acknowledge', async (req, res) => {
 
   const incident = await prisma.supportTicket.findUnique({
     where: { id: req.params.id },
-    select: { id: true, userId: true, category: true, description: true }
+    select: { id: true, userId: true, category: true, status: true, description: true }
   })
   if (!incident || !SAFETY_INCIDENT_CATEGORIES.includes(incident.category as (typeof SAFETY_INCIDENT_CATEGORIES)[number])) {
     return res.status(404).json({ error: 'Safety incident not found' })
@@ -1208,6 +1466,17 @@ router.post('/safety/incidents/:id/acknowledge', async (req, res) => {
     rideId: nextMeta.rideId ?? null,
     eventType: 'ADMIN_SAFETY_ACKNOWLEDGED',
     metadata: { adminId: auth.userId, note: parsed.data.note ?? null }
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SAFETY_ACKNOWLEDGE',
+    targetType: 'SAFETY_INCIDENT',
+    targetId: incident.id,
+    summary: `Incident ${incident.id.slice(0, 8)} acknowledged`,
+    before: { status: incident.status ?? 'OPEN' },
+    after: { status: 'IN_REVIEW' },
+    metadata: { note: parsed.data.note ?? null }
   })
 
   return res.json({ ok: true, incident: updated })
@@ -1260,6 +1529,17 @@ router.post('/safety/incidents/:id/assign', async (req, res) => {
     rideId: nextMeta.rideId ?? null,
     eventType: 'ADMIN_SAFETY_ASSIGNED',
     metadata: { adminId: auth.userId, assigneeId, note: parsed.data.note ?? null }
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SAFETY_ASSIGN',
+    targetType: 'SAFETY_INCIDENT',
+    targetId: incident.id,
+    summary: `Incident ${incident.id.slice(0, 8)} assigned to ${assigneeId.slice(0, 8)}`,
+    before: { assigneeId: parsedMeta.meta.assigneeId ?? null },
+    after: { assigneeId },
+    metadata: { note: parsed.data.note ?? null }
   })
 
   return res.json({ ok: true, incident: updated, assigneeId })
@@ -1317,6 +1597,20 @@ router.post('/safety/incidents/:id/escalate', async (req, res) => {
         email: reporter.email ?? null
       }
       : undefined
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'SAFETY_ESCALATE',
+    targetType: 'SAFETY_INCIDENT',
+    targetId: incident.id,
+    summary: `Incident ${incident.id.slice(0, 8)} escalated to ${parsed.data.priority}`,
+    before: { priority: parsedMeta.meta.priority ?? 'HIGH' },
+    after: { priority: parsed.data.priority },
+    metadata: {
+      reason: parsed.data.reason,
+      deadLetters: delivery.deadLetters ?? 0
+    }
   })
 
   return res.json({ ok: true, incident: updated, priority: parsed.data.priority, delivery })
@@ -1496,6 +1790,54 @@ router.get('/vehicles', async (req, res) => {
   })
 })
 
+router.get('/vehicles/:id/history', async (req, res) => {
+  const parsed = z.object({
+    action: z.enum(FLEET_HISTORY_ACTIONS).optional(),
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20)
+  }).safeParse(req.query)
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
+
+  const exists = await prisma.vehicle.findUnique({
+    where: { id: req.params.id },
+    select: { id: true }
+  })
+  if (!exists) return res.status(404).json({ error: 'Vehicle not found' })
+
+  const where = {
+    targetType: 'VEHICLE',
+    targetId: req.params.id,
+    ...(parsed.data.action ? { action: parsed.data.action } : {})
+  }
+  const skip = (parsed.data.page - 1) * parsed.data.limit
+
+  const auditRepo = (prisma as any).adminAuditLog
+  if (!auditRepo?.findMany || !auditRepo?.count) {
+    return res.status(501).json({ error: 'Admin audit log store is not available' })
+  }
+
+  const [items, total] = await Promise.all([
+    auditRepo.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parsed.data.limit,
+      include: {
+        admin: { select: { id: true, name: true, phone: true, email: true, role: true } }
+      }
+    }),
+    auditRepo.count({ where })
+  ])
+
+  return res.json({
+    items,
+    page: parsed.data.page,
+    limit: parsed.data.limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / parsed.data.limit))
+  })
+})
+
 router.get('/drivers/available', async (req, res) => {
   const parsed = z.object({
     q: z.string().trim().min(1).max(120).optional(),
@@ -1572,6 +1914,31 @@ router.post('/vehicles', async (req, res) => {
   }).safeParse(req.body)
   if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
 
+  const createStatus = (parsed.data.status ?? 'AVAILABLE') as (typeof VEHICLE_STATUSES)[number]
+  const createBatteryLevel = typeof parsed.data.batteryLevel === 'number' ? parsed.data.batteryLevel : undefined
+  if (createStatus === 'IN_USE') {
+    if (!parsed.data.driverId) {
+      return res.status(422).json({ error: 'Vehicle must have an assigned driver before setting IN_USE' })
+    }
+    if (typeof createBatteryLevel !== 'number') {
+      return res.status(422).json({ error: 'Battery level is required before setting IN_USE' })
+    }
+    if (createBatteryLevel < 15) {
+      return res.status(422).json({ error: 'Battery level must be at least 15% before setting IN_USE' })
+    }
+  }
+  if (createStatus === 'AVAILABLE' && typeof createBatteryLevel === 'number' && createBatteryLevel < 10) {
+    return res.status(422).json({ error: 'Battery level below 10% must remain in CHARGING or MAINTENANCE' })
+  }
+  if (createStatus === 'CHARGING') {
+    if (typeof createBatteryLevel !== 'number') {
+      return res.status(422).json({ error: 'Battery level is required when setting CHARGING' })
+    }
+    if (createBatteryLevel >= 100) {
+      return res.status(422).json({ error: 'Battery level must be below 100% when setting CHARGING' })
+    }
+  }
+
   if (parsed.data.driverId) {
     const driver = await prisma.user.findUnique({
       where: { id: parsed.data.driverId },
@@ -1587,6 +1954,7 @@ router.post('/vehicles', async (req, res) => {
     if (existingVehicle) return res.status(409).json({ error: 'Driver already has an assigned vehicle' })
   }
 
+  const auth = getAuthContext(res)
   try {
     const vehicle = await prisma.vehicle.create({
       data: {
@@ -1601,6 +1969,18 @@ router.post('/vehicles', async (req, res) => {
       },
       include: {
         driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
+      }
+    })
+    await recordAdminAudit({
+      adminId: auth.userId,
+      action: 'FLEET_CREATE_VEHICLE',
+      targetType: 'VEHICLE',
+      targetId: vehicle.id,
+      summary: `Vehicle ${vehicle.plateNumber} created`,
+      after: {
+        plateNumber: vehicle.plateNumber,
+        status: vehicle.status,
+        driverId: vehicle.driverId ?? null
       }
     })
     return res.status(201).json({ ok: true, vehicle })
@@ -1651,6 +2031,17 @@ router.post('/vehicles/:id/assign-driver', async (req, res) => {
     }
   })
 
+  const auth = getAuthContext(res)
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'FLEET_ASSIGN_DRIVER',
+    targetType: 'VEHICLE',
+    targetId: vehicle.id,
+    summary: `Vehicle ${vehicle.id.slice(0, 8)} driver assignment updated`,
+    before: { driverId: vehicle.driverId ?? null },
+    after: { driverId: nextDriverId }
+  })
+
   return res.json({ ok: true, vehicle: updated })
 })
 
@@ -1663,9 +2054,44 @@ router.post('/vehicles/:id/status', async (req, res) => {
 
   const vehicle = await prisma.vehicle.findUnique({
     where: { id: req.params.id },
-    select: { id: true }
+    select: { id: true, status: true, driverId: true, batteryLevel: true }
   })
   if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' })
+
+  const currentStatus = vehicle.status as (typeof VEHICLE_STATUSES)[number]
+  const nextStatus = parsed.data.status as (typeof VEHICLE_STATUSES)[number]
+  if (!isAllowedVehicleStatusTransition(currentStatus, nextStatus)) {
+    return res.status(409).json({ error: `Invalid vehicle status transition from ${currentStatus} to ${nextStatus}` })
+  }
+
+  const effectiveBatteryLevel = typeof parsed.data.batteryLevel === 'number'
+    ? parsed.data.batteryLevel
+    : vehicle.batteryLevel
+
+  if (nextStatus === 'IN_USE') {
+    if (!vehicle.driverId) {
+      return res.status(422).json({ error: 'Vehicle must have an assigned driver before setting IN_USE' })
+    }
+    if (typeof effectiveBatteryLevel !== 'number') {
+      return res.status(422).json({ error: 'Battery level is required before setting IN_USE' })
+    }
+    if (effectiveBatteryLevel < 15) {
+      return res.status(422).json({ error: 'Battery level must be at least 15% before setting IN_USE' })
+    }
+  }
+
+  if (nextStatus === 'AVAILABLE' && typeof effectiveBatteryLevel === 'number' && effectiveBatteryLevel < 10) {
+    return res.status(422).json({ error: 'Battery level below 10% must remain in CHARGING or MAINTENANCE' })
+  }
+
+  if (nextStatus === 'CHARGING') {
+    if (typeof parsed.data.batteryLevel !== 'number') {
+      return res.status(422).json({ error: 'Battery level is required when setting CHARGING' })
+    }
+    if (parsed.data.batteryLevel >= 100) {
+      return res.status(422).json({ error: 'Battery level must be below 100% when setting CHARGING' })
+    }
+  }
 
   const updated = await prisma.vehicle.update({
     where: { id: vehicle.id },
@@ -1675,6 +2101,27 @@ router.post('/vehicles/:id/status', async (req, res) => {
     },
     include: {
       driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
+    }
+  })
+
+  const auth = getAuthContext(res)
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'FLEET_UPDATE_STATUS',
+    targetType: 'VEHICLE',
+    targetId: vehicle.id,
+    summary: `Vehicle ${vehicle.id.slice(0, 8)} status updated from ${vehicle.status} to ${parsed.data.status}`,
+    before: {
+      status: vehicle.status,
+      batteryLevel: vehicle.batteryLevel ?? null
+    },
+    after: {
+      status: parsed.data.status,
+      batteryLevel: typeof parsed.data.batteryLevel === 'number' ? parsed.data.batteryLevel : vehicle.batteryLevel ?? null
+    },
+    metadata: {
+      transition: `${vehicle.status}->${parsed.data.status}`,
+      hasDriver: Boolean(vehicle.driverId)
     }
   })
 
@@ -1714,6 +2161,9 @@ router.put('/pricing', async (req, res) => {
     return res.status(422).json({ error: 'minimumFare must be greater than or equal to baseFare' })
   }
 
+  const auth = getAuthContext(res)
+  const previous = await prisma.fareConfig.findUnique({ where: { id: 'default' } })
+
   const config = await prisma.fareConfig.upsert({
     where: { id: 'default' },
     update: {
@@ -1730,6 +2180,30 @@ router.put('/pricing', async (req, res) => {
       perMinuteRate: parsed.data.perMinuteRate,
       minimumFare: parsed.data.minimumFare,
       currency: (parsed.data.currency ?? 'PHP').toUpperCase()
+    }
+  })
+
+  await recordAdminAudit({
+    adminId: auth.userId,
+    action: 'PRICING_UPDATE',
+    targetType: 'FARE_CONFIG',
+    targetId: 'default',
+    summary: 'Updated fare configuration',
+    before: previous
+      ? {
+        baseFare: previous.baseFare,
+        perKmRate: previous.perKmRate,
+        perMinuteRate: previous.perMinuteRate,
+        minimumFare: previous.minimumFare,
+        currency: previous.currency
+      }
+      : null,
+    after: {
+      baseFare: config.baseFare,
+      perKmRate: config.perKmRate,
+      perMinuteRate: config.perMinuteRate,
+      minimumFare: config.minimumFare,
+      currency: config.currency
     }
   })
 

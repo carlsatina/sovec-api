@@ -59,6 +59,39 @@ Seeded admin user for local testing:
 - Phone: `+639179999999`
 - Role: `ADMIN`
 
+## Admin Bootstrap (Hardened)
+Use this when you need to promote a real account to `ADMIN` without relying on seed data.
+
+Command:
+```bash
+BOOTSTRAP_PHONE=+639171111111 \
+ADMIN_BOOTSTRAP_SECRET=<server-secret> \
+BOOTSTRAP_SECRET=<same-secret> \
+npm run admin:bootstrap
+```
+
+Behavior:
+- Promotes an existing `PASSENGER` or `DRIVER` user to `ADMIN`
+- Idempotent for existing admin user (returns success with `mode=already_admin`)
+- One-time guard: blocked if any `ADMIN` already exists
+  - Override only when needed:
+  - `ALLOW_ADMIN_BOOTSTRAP_WHEN_ADMIN_EXISTS=true`
+- Refuses insecure mode unless explicitly allowed:
+  - `ALLOW_INSECURE_ADMIN_BOOTSTRAP=true` (local/dev only)
+
+Required env for secure mode:
+- `ADMIN_BOOTSTRAP_SECRET` (server-side configured secret)
+- `BOOTSTRAP_SECRET` (operator-provided secret for the command)
+
+How to get an `ADMIN_TOKEN` after bootstrap:
+1. `POST /auth/otp/send` using the promoted admin phone
+2. `POST /auth/otp/verify` with OTP code
+3. Use returned JWT as `ADMIN_TOKEN`
+
+Token rotation:
+- Rotate `JWT_SECRET` to invalidate existing tokens globally.
+- Recommended process: deploy new `JWT_SECRET`, then re-login admins to obtain new tokens.
+
 ## Run Locally
 Development (watch mode):
 ```bash
@@ -162,8 +195,23 @@ Health check endpoint:
 - `POST /admin/vehicles/:id/assign-driver`
   - Body: `{ driverId? }`
   - Use `null`/empty to unassign vehicle driver
+- `GET /admin/vehicles/:id/history`
+  - Query params:
+    - `action`: `FLEET_CREATE_VEHICLE | FLEET_ASSIGN_DRIVER | FLEET_UPDATE_STATUS` (optional)
+    - `page`: default `1`
+    - `limit`: default `20`, max `100`
+  - Returns fleet action history from admin audit logs for one vehicle
 - `POST /admin/vehicles/:id/status`
   - Body: `{ status, batteryLevel? }`
+  - Transition rules:
+    - `IN_USE -> AVAILABLE` only
+    - `CHARGING -> AVAILABLE` only
+    - `MAINTENANCE -> AVAILABLE` only
+    - `AVAILABLE -> AVAILABLE | IN_USE | CHARGING | MAINTENANCE`
+  - Validation rules:
+    - `IN_USE` requires assigned driver and battery `>= 15%`
+    - `AVAILABLE` rejects battery `< 10%`
+    - `CHARGING` requires explicit battery value `< 100%`
 - `GET /admin/support/tickets`
   - Query params:
     - `status`: `OPEN | IN_REVIEW | RESOLVED | CLOSED`
@@ -226,6 +274,14 @@ Health check endpoint:
   - Query params:
     - `days`: integer `1..90` (default `7`)
   - Returns daily buckets with `rides`, `completedRides`, `cancelledRides`, `revenue`
+- `GET /admin/audit-logs`
+  - Query params:
+    - `actorId` (admin user id)
+    - `action` (exact action code)
+    - `targetType` (exact target type)
+    - `q` search on id/summary/action/target/admin
+    - `page`, `limit`
+  - Returns admin audit trail entries with actor info
 
 Fare computation (`/bookings/estimate` and booking creation) now uses the persisted admin pricing config.
 
@@ -240,14 +296,17 @@ SOS API:
 - Default auto-selection:
   - Runs `auth` when `SMOKE_PHONE` is set
   - Runs admin suites (`admin-fleet`, `admin-support`, `admin-analytics`, `admin-safety`) when `ADMIN_TOKEN` is set
+  - `admin-bootstrap` is opt-in only (never auto-selected)
 - Explicit suite selection:
   - `SMOKE_SUITES=auth npm run smoke`
+  - `SMOKE_SUITES=admin-bootstrap BOOTSTRAP_PHONE=+639171111111 ADMIN_BOOTSTRAP_SECRET=<secret> BOOTSTRAP_SECRET=<secret> npm run smoke`
   - `SMOKE_SUITES=admin-fleet,admin-support npm run smoke`
   - `SMOKE_SUITES=admin-analytics SMOKE_ANALYTICS_DAYS=30 npm run smoke`
   - `SMOKE_SUITES=admin-safety ADMIN_TOKEN=<admin-jwt> npm run smoke`
 - Suite-specific env vars:
   - Auth: `SMOKE_PHONE`, optional `SMOKE_OTP_CODE`
-  - Admin fleet: `ADMIN_TOKEN`, optional `SMOKE_DRIVER_ID`
+  - Admin bootstrap: `BOOTSTRAP_PHONE`, `ADMIN_BOOTSTRAP_SECRET`, `BOOTSTRAP_SECRET` (or `ALLOW_INSECURE_ADMIN_BOOTSTRAP=true`), optional `SMOKE_OTP_CODE`
+  - Admin fleet: `ADMIN_TOKEN`, optional `SMOKE_DRIVER_ID` (enables assignment + `IN_USE` transition checks)
   - Admin support: `ADMIN_TOKEN`, optional `SMOKE_SUPPORT_TICKET_ID`, optional `SMOKE_SUPPORT_CATEGORY`
   - Admin analytics: `ADMIN_TOKEN`, optional `SMOKE_ANALYTICS_DAYS`
   - Admin safety: `ADMIN_TOKEN`, optional `SMOKE_SAFETY_INCIDENT_ID`, optional `SMOKE_RETRY_DEAD_LETTER=true`

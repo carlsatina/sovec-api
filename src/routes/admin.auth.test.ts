@@ -21,6 +21,7 @@ const originalPrisma = {
   vehicle: (prisma as any).vehicle,
   supportTicket: (prisma as any).supportTicket,
   safetyDeliveryLog: (prisma as any).safetyDeliveryLog,
+  adminAuditLog: (prisma as any).adminAuditLog,
   notification: (prisma as any).notification,
   rideEvent: (prisma as any).rideEvent,
   safetyTemplate: (prisma as any).safetyTemplate,
@@ -35,6 +36,7 @@ afterEach(() => {
   ;(prisma as any).vehicle = originalPrisma.vehicle
   ;(prisma as any).supportTicket = originalPrisma.supportTicket
   ;(prisma as any).safetyDeliveryLog = originalPrisma.safetyDeliveryLog
+  ;(prisma as any).adminAuditLog = originalPrisma.adminAuditLog
   ;(prisma as any).notification = originalPrisma.notification
   ;(prisma as any).rideEvent = originalPrisma.rideEvent
   ;(prisma as any).safetyTemplate = originalPrisma.safetyTemplate
@@ -137,6 +139,12 @@ test('GET /admin/drivers/available requires auth token', async () => {
   assert.equal(res.status, 401)
 })
 
+test('GET /admin/vehicles/:id/history requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).get('/admin/vehicles/vehicle-1/history')
+  assert.equal(res.status, 401)
+})
+
 test('GET /admin/support/tickets requires auth token', async () => {
   const app = createTestApp()
   const res = await request(app).get('/admin/support/tickets')
@@ -222,6 +230,42 @@ test('GET /admin/safety/delivery-logs requires ADMIN role', async () => {
 
   const res = await request(app)
     .get('/admin/safety/delivery-logs')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
+})
+
+test('GET /admin/audit-logs requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).get('/admin/audit-logs')
+  assert.equal(res.status, 401)
+})
+
+test('GET /admin/audit-logs requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .get('/admin/audit-logs')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
+})
+
+test('GET /admin/vehicles/:id/history requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .get('/admin/vehicles/vehicle-1/history')
     .set('Authorization', `Bearer ${token}`)
 
   assert.equal(res.status, 403)
@@ -390,6 +434,63 @@ test('POST /admin/vehicles rejects non-driver assignment', async () => {
   assert.match(res.body.error, /DRIVER role/i)
 })
 
+test('POST /admin/vehicles rejects IN_USE without assigned driver', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const res = await request(app)
+    .post('/admin/vehicles')
+    .set('Authorization', `Bearer ${token}`)
+    .send({
+      plateNumber: 'SMK1001',
+      model: 'EV Unit',
+      capacity: 4,
+      status: 'IN_USE',
+      batteryLevel: 60
+    })
+
+  assert.equal(res.status, 422)
+  assert.match(res.body.error, /assigned driver/i)
+})
+
+test('POST /admin/vehicles rejects CHARGING with invalid battery payload', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const resMissingBattery = await request(app)
+    .post('/admin/vehicles')
+    .set('Authorization', `Bearer ${token}`)
+    .send({
+      plateNumber: 'SMK1002',
+      model: 'EV Unit',
+      capacity: 4,
+      status: 'CHARGING'
+    })
+  assert.equal(resMissingBattery.status, 422)
+  assert.match(resMissingBattery.body.error, /Battery level is required/i)
+
+  const resFullBattery = await request(app)
+    .post('/admin/vehicles')
+    .set('Authorization', `Bearer ${token}`)
+    .send({
+      plateNumber: 'SMK1003',
+      model: 'EV Unit',
+      capacity: 4,
+      status: 'CHARGING',
+      batteryLevel: 100
+    })
+  assert.equal(resFullBattery.status, 422)
+  assert.match(resFullBattery.body.error, /below 100/i)
+})
+
 test('POST /admin/vehicles/:id/assign-driver returns conflict when driver already has vehicle', async () => {
   const app = createTestApp()
   const token = signAuthToken({
@@ -433,6 +534,102 @@ test('POST /admin/vehicles/:id/status returns 404 when vehicle is missing', asyn
     .send({ status: 'CHARGING' })
 
   assert.equal(res.status, 404)
+})
+
+test('GET /admin/vehicles/:id/history applies filters and pagination', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1' })
+  }
+
+  let capturedWhere: unknown = null
+  ;(prisma as any).adminAuditLog = {
+    findMany: async (args: any) => {
+      capturedWhere = args.where
+      return []
+    },
+    count: async () => 0
+  }
+
+  const res = await request(app)
+    .get('/admin/vehicles/vehicle-1/history?action=FLEET_UPDATE_STATUS&page=1&limit=20')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(capturedWhere, {
+    targetType: 'VEHICLE',
+    targetId: 'vehicle-1',
+    action: 'FLEET_UPDATE_STATUS'
+  })
+})
+
+test('POST /admin/vehicles/:id/status rejects invalid transition', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1', status: 'IN_USE', driverId: 'driver-1', batteryLevel: 80 })
+  }
+
+  const res = await request(app)
+    .post('/admin/vehicles/vehicle-1/status')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ status: 'CHARGING', batteryLevel: 50 })
+
+  assert.equal(res.status, 409)
+  assert.match(res.body.error, /Invalid vehicle status transition/i)
+})
+
+test('POST /admin/vehicles/:id/status rejects IN_USE without assigned driver', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1', status: 'AVAILABLE', driverId: null, batteryLevel: 80 })
+  }
+
+  const res = await request(app)
+    .post('/admin/vehicles/vehicle-1/status')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ status: 'IN_USE' })
+
+  assert.equal(res.status, 422)
+  assert.match(res.body.error, /assigned driver/i)
+})
+
+test('POST /admin/vehicles/:id/status requires battery when setting CHARGING', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1', status: 'AVAILABLE', driverId: null, batteryLevel: 60 })
+  }
+
+  const res = await request(app)
+    .post('/admin/vehicles/vehicle-1/status')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ status: 'CHARGING' })
+
+  assert.equal(res.status, 422)
+  assert.match(res.body.error, /Battery level is required when setting CHARGING/i)
 })
 
 test('GET /admin/payments applies filters and returns pagination', async () => {
@@ -897,6 +1094,44 @@ test('GET /admin/safety/delivery-logs applies filters and pagination', async () 
       { incidentId: { contains: 'timeout', mode: 'insensitive' } },
       { target: { contains: 'timeout', mode: 'insensitive' } },
       { lastError: { contains: 'timeout', mode: 'insensitive' } }
+    ]
+  })
+})
+
+test('GET /admin/audit-logs applies filters and pagination', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  let capturedWhere: unknown = null
+  ;(prisma as any).adminAuditLog = {
+    findMany: async (args: any) => {
+      capturedWhere = args.where
+      return []
+    },
+    count: async () => 0
+  }
+
+  const res = await request(app)
+    .get('/admin/audit-logs?actorId=admin-1&action=SAFETY_ESCALATE&targetType=SAFETY_INCIDENT&q=critical&page=1&limit=20')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(capturedWhere, {
+    adminId: 'admin-1',
+    action: 'SAFETY_ESCALATE',
+    targetType: 'SAFETY_INCIDENT',
+    OR: [
+      { id: { contains: 'critical', mode: 'insensitive' } },
+      { targetId: { contains: 'critical', mode: 'insensitive' } },
+      { summary: { contains: 'critical', mode: 'insensitive' } },
+      { action: { contains: 'critical', mode: 'insensitive' } },
+      { targetType: { contains: 'critical', mode: 'insensitive' } },
+      { admin: { name: { contains: 'critical', mode: 'insensitive' } } },
+      { admin: { phone: { contains: 'critical', mode: 'insensitive' } } }
     ]
   })
 })
