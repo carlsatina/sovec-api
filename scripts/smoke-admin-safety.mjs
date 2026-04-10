@@ -3,6 +3,7 @@
 const API_URL = process.env.API_URL ?? 'http://localhost:4000'
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN
 const SMOKE_SAFETY_INCIDENT_ID = process.env.SMOKE_SAFETY_INCIDENT_ID
+const SMOKE_RETRY_DEAD_LETTER = (process.env.SMOKE_RETRY_DEAD_LETTER ?? '').trim().toLowerCase() === 'true'
 
 if (!ADMIN_TOKEN) {
   console.error('Missing ADMIN_TOKEN. Example: ADMIN_TOKEN=<jwt> SMOKE_SUITES=admin-safety npm run smoke')
@@ -60,6 +61,10 @@ async function run() {
   const templates = await requestJson('/admin/safety/templates')
   assertOk('GET /admin/safety/templates', templates)
   console.log('[PASS] GET /admin/safety/templates')
+
+  const logs = await requestJson('/admin/safety/delivery-logs?page=1&limit=5')
+  assertOk('GET /admin/safety/delivery-logs', logs)
+  console.log('[PASS] GET /admin/safety/delivery-logs')
 
   const updateTemplate = await requestJson('/admin/safety/templates/ESCALATION_ADMIN', {
     method: 'PUT',
@@ -128,6 +133,19 @@ async function run() {
     process.exit(1)
   }
   console.log('[PASS] GET /admin/safety/incidents resolved (updated incident found)')
+
+  const deadLetters = await requestJson(`/admin/safety/delivery-logs?incidentId=${encodeURIComponent(incidentId)}&status=DEAD_LETTER&page=1&limit=5`)
+  assertOk('GET /admin/safety/delivery-logs dead letters', deadLetters)
+  const deadLetterItems = Array.isArray(deadLetters.json?.items) ? deadLetters.json.items : []
+  if (!SMOKE_RETRY_DEAD_LETTER) {
+    console.log('[INFO] Skipping dead-letter retry. Set SMOKE_RETRY_DEAD_LETTER=true to enable.')
+  } else if (deadLetterItems.length > 0 && deadLetterItems[0]?.id) {
+    const retry = await requestJson(`/admin/safety/delivery-logs/${deadLetterItems[0].id}/retry`, { method: 'POST' })
+    assertOk('POST /admin/safety/delivery-logs/:id/retry', retry)
+    console.log('[PASS] POST /admin/safety/delivery-logs/:id/retry')
+  } else {
+    console.log('[INFO] No dead-letter log available for retry in this environment')
+  }
 
   console.log('Admin safety smoke test completed successfully.')
 }

@@ -37,10 +37,16 @@ cp .env.example .env
   - `SEMAPHORE_API_KEY`
   - `SEMAPHORE_SENDER_NAME` (optional)
   - `SEMAPHORE_OTP_MESSAGE` (optional, supports `{otp}` placeholder)
+- `EMAIL_PROVIDER` (`stub` or `resend`)
+- If using Resend:
+  - `RESEND_API_KEY`
+  - `RESEND_FROM_EMAIL` (must be a verified sender/domain in Resend)
 - Safety escalation channels (optional):
   - `SAFETY_ESCALATION_PHONES` (comma-separated phone numbers for SMS alerts)
-  - `SAFETY_ESCALATION_EMAILS` (comma-separated email recipients; currently stub-logged)
+  - `SAFETY_ESCALATION_EMAILS` (comma-separated email recipients)
   - `SAFETY_ESCALATION_WEBHOOK_URL` (POST webhook endpoint for escalation/resolution events)
+  - `SAFETY_DELIVERY_MAX_ATTEMPTS` (default `3`)
+  - `SAFETY_DELIVERY_RETRY_DELAY_MS` (default `250`)
 
 ## Database Workflow
 ```bash
@@ -191,6 +197,7 @@ Health check endpoint:
 - `POST /admin/safety/incidents/:id/resolve`
   - Body: `{ status: RESOLVED|CLOSED, action, note? }`
   - Updates incident status, app notification, and escalation-channel fan-out (SMS/email/webhook)
+  - Delivery uses retry policy and writes delivery/dead-letter logs into `SafetyDeliveryLog`
 - `POST /admin/safety/incidents/:id/acknowledge`
   - Body: `{ note? }`
   - Marks incident `IN_REVIEW` and records acknowledgement metadata
@@ -200,6 +207,16 @@ Health check endpoint:
 - `POST /admin/safety/incidents/:id/escalate`
   - Body: `{ priority: LOW|MEDIUM|HIGH|CRITICAL, reason }`
   - Updates incident priority, records escalation metadata, and triggers channel fan-out
+- `GET /admin/safety/delivery-logs`
+  - Query params:
+    - `incidentId` (optional)
+    - `status`: `DELIVERED | DEAD_LETTER` (optional)
+    - `channel`: `sms | email | webhook` (optional)
+    - `q`: search on id/incident/target/error
+    - `page`, `limit`
+- `POST /admin/safety/delivery-logs/:id/retry`
+  - Retries a dead-lettered safety delivery log entry
+  - Fails fast for unsupported `event` / `channel` log rows
 - `GET /admin/analytics/overview`
   - Returns:
     - `today`: rides, completed/cancelled rides, revenue
@@ -233,4 +250,4 @@ SOS API:
   - Admin fleet: `ADMIN_TOKEN`, optional `SMOKE_DRIVER_ID`
   - Admin support: `ADMIN_TOKEN`, optional `SMOKE_SUPPORT_TICKET_ID`, optional `SMOKE_SUPPORT_CATEGORY`
   - Admin analytics: `ADMIN_TOKEN`, optional `SMOKE_ANALYTICS_DAYS`
-  - Admin safety: `ADMIN_TOKEN`, optional `SMOKE_SAFETY_INCIDENT_ID`
+  - Admin safety: `ADMIN_TOKEN`, optional `SMOKE_SAFETY_INCIDENT_ID`, optional `SMOKE_RETRY_DEAD_LETTER=true`

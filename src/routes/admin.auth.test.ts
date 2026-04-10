@@ -20,6 +20,7 @@ const originalPrisma = {
   user: (prisma as any).user,
   vehicle: (prisma as any).vehicle,
   supportTicket: (prisma as any).supportTicket,
+  safetyDeliveryLog: (prisma as any).safetyDeliveryLog,
   notification: (prisma as any).notification,
   rideEvent: (prisma as any).rideEvent,
   safetyTemplate: (prisma as any).safetyTemplate,
@@ -33,6 +34,7 @@ afterEach(() => {
   ;(prisma as any).user = originalPrisma.user
   ;(prisma as any).vehicle = originalPrisma.vehicle
   ;(prisma as any).supportTicket = originalPrisma.supportTicket
+  ;(prisma as any).safetyDeliveryLog = originalPrisma.safetyDeliveryLog
   ;(prisma as any).notification = originalPrisma.notification
   ;(prisma as any).rideEvent = originalPrisma.rideEvent
   ;(prisma as any).safetyTemplate = originalPrisma.safetyTemplate
@@ -202,6 +204,27 @@ test('GET /admin/safety/templates requires auth token', async () => {
   const app = createTestApp()
   const res = await request(app).get('/admin/safety/templates')
   assert.equal(res.status, 401)
+})
+
+test('GET /admin/safety/delivery-logs requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).get('/admin/safety/delivery-logs')
+  assert.equal(res.status, 401)
+})
+
+test('GET /admin/safety/delivery-logs requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .get('/admin/safety/delivery-logs')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
 })
 
 test('GET /admin/safety/templates requires ADMIN role', async () => {
@@ -842,6 +865,111 @@ test('GET /admin/safety/incidents post-filters paginate correctly beyond 500 rec
   assert.equal(res.body.total, 650)
   assert.equal(res.body.totalPages, 33)
   assert.equal(res.body.items.length, 20)
+})
+
+test('GET /admin/safety/delivery-logs applies filters and pagination', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  let capturedWhere: unknown = null
+  ;(prisma as any).safetyDeliveryLog = {
+    findMany: async (args: any) => {
+      capturedWhere = args.where
+      return []
+    },
+    count: async () => 0
+  }
+
+  const res = await request(app)
+    .get('/admin/safety/delivery-logs?status=DEAD_LETTER&channel=email&q=timeout&page=1&limit=20')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(capturedWhere, {
+    status: 'DEAD_LETTER',
+    channel: 'email',
+    OR: [
+      { id: { contains: 'timeout', mode: 'insensitive' } },
+      { incidentId: { contains: 'timeout', mode: 'insensitive' } },
+      { target: { contains: 'timeout', mode: 'insensitive' } },
+      { lastError: { contains: 'timeout', mode: 'insensitive' } }
+    ]
+  })
+})
+
+test('POST /admin/safety/delivery-logs/:id/retry retries dead-letter log', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const prevSmsProvider = process.env.SMS_PROVIDER
+  process.env.SMS_PROVIDER = 'mock'
+
+  let createCalls = 0
+  ;(prisma as any).safetyDeliveryLog = {
+    findUnique: async () => ({
+      id: 'dl-1',
+      incidentId: 'inc-1',
+      event: 'safety.escalated',
+      channel: 'sms',
+      target: '+639171234567',
+      status: 'DEAD_LETTER',
+      attempts: 3,
+      payload: { message: 'Retry me' }
+    }),
+    create: async () => {
+      createCalls += 1
+      return { id: 'dl-2' }
+    }
+  }
+
+  const res = await request(app)
+    .post('/admin/safety/delivery-logs/dl-1/retry')
+    .set('Authorization', `Bearer ${token}`)
+    .send({})
+
+  process.env.SMS_PROVIDER = prevSmsProvider
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.retry.ok, true)
+  assert.equal(createCalls, 1)
+})
+
+test('POST /admin/safety/delivery-logs/:id/retry rejects unsupported channel', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).safetyDeliveryLog = {
+    findUnique: async () => ({
+      id: 'dl-1',
+      incidentId: 'inc-1',
+      event: 'safety.escalated',
+      channel: 'push',
+      target: 'device-token',
+      status: 'DEAD_LETTER',
+      attempts: 3,
+      payload: { message: 'Retry me' }
+    })
+  }
+
+  const res = await request(app)
+    .post('/admin/safety/delivery-logs/dl-1/retry')
+    .set('Authorization', `Bearer ${token}`)
+    .send({})
+
+  assert.equal(res.status, 422)
+  assert.match(res.body.error, /Unsupported delivery channel/i)
 })
 
 test('POST /admin/safety/incidents/:id/acknowledge updates status to IN_REVIEW', async () => {

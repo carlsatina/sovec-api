@@ -262,3 +262,21 @@ model SafetyTemplate {
   body      String
   updatedAt DateTime @updatedAt
 }
+
+model SafetyDeliveryLog {
+  id             String   @id @default(cuid())
+  incidentId     String
+  event          String
+  channel        String
+  target         String
+  status         String
+  attempts       Int
+  lastError      String?
+  payload        Json?
+  deliveredAt    DateTime?
+  deadLetteredAt DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([incidentId, createdAt])
+  @@index([status, createdAt])
+}

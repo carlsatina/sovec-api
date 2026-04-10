@@ -1,5 +1,7 @@
 import { sendTextSms } from './sms.js'
 import prisma from '../db.js'
+import { sendEmail } from './email.js'
+import type { Prisma } from '@prisma/client'
 
 export const SAFETY_TEMPLATE_KEYS = ['ESCALATION_ADMIN', 'ESCALATION_REPORTER', 'RESOLUTION_REPORTER'] as const
 export type SafetyTemplateKey = (typeof SAFETY_TEMPLATE_KEYS)[number]
@@ -8,6 +10,11 @@ export type SafetyTemplate = {
   subject: string
   body: string
 }
+
+type DeliveryEvent = 'safety.escalated' | 'safety.resolved'
+type DeliveryChannel = 'sms' | 'email' | 'webhook'
+const DELIVERY_EVENTS: DeliveryEvent[] = ['safety.escalated', 'safety.resolved']
+const DELIVERY_CHANNELS: DeliveryChannel[] = ['sms', 'email', 'webhook']
 
 const defaultTemplates: Record<SafetyTemplateKey, SafetyTemplate> = {
   ESCALATION_ADMIN: {
@@ -39,6 +46,19 @@ function parseCsv(value?: string) {
 function getWebhookUrl() {
   const value = process.env.SAFETY_ESCALATION_WEBHOOK_URL?.trim()
   return value || null
+}
+
+function getRetryConfig() {
+  const maxAttemptsRaw = Number(process.env.SAFETY_DELIVERY_MAX_ATTEMPTS ?? 3)
+  const retryDelayRaw = Number(process.env.SAFETY_DELIVERY_RETRY_DELAY_MS ?? 250)
+  const maxAttempts = Number.isFinite(maxAttemptsRaw) ? Math.max(1, Math.min(10, Math.floor(maxAttemptsRaw))) : 3
+  const retryDelayMs = Number.isFinite(retryDelayRaw) ? Math.max(0, Math.min(10_000, Math.floor(retryDelayRaw))) : 250
+  return { maxAttempts, retryDelayMs }
+}
+
+async function waitMs(ms: number) {
+  if (ms <= 0) return
+  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 async function ensureDefaultTemplates() {
@@ -95,9 +115,94 @@ export function resetSafetyTemplatesForTests() {
   // No-op now that templates are persisted in DB.
 }
 
-async function sendEmailStub(email: string, subject: string, body: string) {
-  console.log(`[email:stub] to=${email} subject=${subject} body=${body}`)
-  return { ok: true as const }
+async function createSafetyDeliveryLog(data: {
+  incidentId: string
+  event: DeliveryEvent
+  channel: DeliveryChannel
+  target: string
+  status: 'DELIVERED' | 'DEAD_LETTER'
+  attempts: number
+  lastError?: string
+  payload?: Prisma.JsonValue
+}) {
+  const repo = (prisma as any).safetyDeliveryLog
+  if (!repo?.create) return
+  await repo.create({
+    data: {
+      incidentId: data.incidentId,
+      event: data.event,
+      channel: data.channel,
+      target: data.target,
+      status: data.status,
+      attempts: data.attempts,
+      lastError: data.lastError ?? null,
+      payload: data.payload ?? null,
+      deliveredAt: data.status === 'DELIVERED' ? new Date() : null,
+      deadLetteredAt: data.status === 'DEAD_LETTER' ? new Date() : null
+    }
+  }).catch((err: unknown) => {
+    console.error('[safety-delivery-log] failed to persist', {
+      incidentId: data.incidentId,
+      event: data.event,
+      channel: data.channel,
+      target: data.target,
+      status: data.status,
+      error: err instanceof Error ? err.message : String(err)
+    })
+  })
+}
+
+async function deliverWithRetry(input: {
+  incidentId: string
+  event: DeliveryEvent
+  channel: DeliveryChannel
+  target: string
+  payload?: Prisma.JsonValue
+  send: () => Promise<void>
+}) {
+  const { maxAttempts, retryDelayMs } = getRetryConfig()
+  let attempts = 0
+  let lastError: string | undefined
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    attempts = attempt
+    try {
+      await input.send()
+      await createSafetyDeliveryLog({
+        incidentId: input.incidentId,
+        event: input.event,
+        channel: input.channel,
+        target: input.target,
+        status: 'DELIVERED',
+        attempts,
+        payload: input.payload
+      })
+      return { channel: input.channel, target: input.target, ok: true as const, attempts }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : 'send failed'
+      if (attempt < maxAttempts) {
+        await waitMs(retryDelayMs * attempt)
+      }
+    }
+  }
+
+  await createSafetyDeliveryLog({
+    incidentId: input.incidentId,
+    event: input.event,
+    channel: input.channel,
+    target: input.target,
+    status: 'DEAD_LETTER',
+    attempts,
+    lastError,
+    payload: input.payload
+  })
+
+  return { channel: input.channel, target: input.target, ok: false as const, attempts, error: lastError }
+}
+
+function asRecord(value: Prisma.JsonValue | null | undefined) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
 }
 
 async function postWebhook(payload: Record<string, unknown>) {
@@ -126,6 +231,7 @@ export async function notifySafetyEscalation(input: {
   reporter?: { name?: string | null; phone?: string | null; email?: string | null }
 }) {
   const templates = await getSafetyTemplates()
+  const event: DeliveryEvent = 'safety.escalated'
   const vars = {
     incidentId: input.incidentId,
     priority: input.priority,
@@ -143,64 +249,166 @@ export async function notifySafetyEscalation(input: {
   const adminPhones = parseCsv(process.env.SAFETY_ESCALATION_PHONES)
   const adminEmails = parseCsv(process.env.SAFETY_ESCALATION_EMAILS)
 
-  const results: Array<{ channel: string; target: string; ok: boolean; error?: string }> = []
+  const results: Array<{ channel: string; target: string; ok: boolean; attempts: number; error?: string }> = []
 
   for (const phone of adminPhones) {
-    try {
-      await sendTextSms(phone, `${adminSubject} - ${adminBody}`)
-      results.push({ channel: 'sms', target: phone, ok: true })
-    } catch (err) {
-      results.push({ channel: 'sms', target: phone, ok: false, error: err instanceof Error ? err.message : 'send failed' })
-    }
+    const message = `${adminSubject} - ${adminBody}`
+    results.push(await deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'sms',
+      target: phone,
+      payload: { message, audience: 'admin' },
+      send: async () => {
+        await sendTextSms(phone, message)
+      }
+    }))
   }
 
   for (const email of adminEmails) {
-    try {
-      await sendEmailStub(email, adminSubject, adminBody)
-      results.push({ channel: 'email', target: email, ok: true })
-    } catch (err) {
-      results.push({ channel: 'email', target: email, ok: false, error: err instanceof Error ? err.message : 'send failed' })
-    }
+    results.push(await deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'email',
+      target: email,
+      payload: { subject: adminSubject, body: adminBody, audience: 'admin' },
+      send: async () => {
+        await sendEmail(email, adminSubject, adminBody)
+      }
+    }))
   }
 
   if (input.reporter?.phone) {
-    try {
-      await sendTextSms(input.reporter.phone, `${reporterSubject} - ${reporterBody}`)
-      results.push({ channel: 'sms', target: input.reporter.phone, ok: true })
-    } catch (err) {
-      results.push({ channel: 'sms', target: input.reporter.phone, ok: false, error: err instanceof Error ? err.message : 'send failed' })
-    }
+    const message = `${reporterSubject} - ${reporterBody}`
+    results.push(await deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'sms',
+      target: input.reporter.phone,
+      payload: { message, audience: 'reporter' },
+      send: async () => {
+        await sendTextSms(input.reporter!.phone!, message)
+      }
+    }))
   }
 
   if (input.reporter?.email) {
-    try {
-      await sendEmailStub(input.reporter.email, reporterSubject, reporterBody)
-      results.push({ channel: 'email', target: input.reporter.email, ok: true })
-    } catch (err) {
-      results.push({ channel: 'email', target: input.reporter.email, ok: false, error: err instanceof Error ? err.message : 'send failed' })
-    }
+    results.push(await deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'email',
+      target: input.reporter.email,
+      payload: { subject: reporterSubject, body: reporterBody, audience: 'reporter' },
+      send: async () => {
+        await sendEmail(input.reporter!.email!, reporterSubject, reporterBody)
+      }
+    }))
   }
 
-  try {
-    const webhookResult = await postWebhook({
-      event: 'safety.escalated',
+  const webhookPayload = {
+    event,
+    incidentId: input.incidentId,
+    priority: input.priority,
+    reason: input.reason,
+    rideId: input.rideId ?? null
+  }
+  if (getWebhookUrl()) {
+    const target = getWebhookUrl() || 'configured'
+    results.push(await deliverWithRetry({
       incidentId: input.incidentId,
-      priority: input.priority,
-      reason: input.reason,
-      rideId: input.rideId ?? null
+      event,
+      channel: 'webhook',
+      target,
+      payload: webhookPayload,
+      send: async () => {
+        const webhookResult = await postWebhook(webhookPayload)
+        if (!webhookResult.sent) {
+          throw new Error('Webhook URL not configured')
+        }
+      }
+    }))
+  } else {
+    await createSafetyDeliveryLog({
+      incidentId: input.incidentId,
+      event,
+      channel: 'webhook',
+      target: 'not-configured',
+      status: 'DEAD_LETTER',
+      attempts: 1,
+      lastError: 'Webhook URL not configured',
+      payload: webhookPayload
     })
-    if (webhookResult.sent) {
-      results.push({ channel: 'webhook', target: getWebhookUrl() || 'configured', ok: true })
-    }
-  } catch (err) {
-    results.push({ channel: 'webhook', target: getWebhookUrl() || 'configured', ok: false, error: err instanceof Error ? err.message : 'send failed' })
+    results.push({ channel: 'webhook', target: 'not-configured', ok: false, attempts: 1, error: 'Webhook URL not configured' })
   }
 
   return {
     delivered: results.filter((x) => x.ok).length,
     attempted: results.length,
+    deadLetters: results.filter((x) => !x.ok).length,
     results
   }
+}
+
+export async function retrySafetyDeliveryLog(input: {
+  incidentId: string
+  event: string
+  channel: string
+  target: string
+  payload?: Prisma.JsonValue | null
+}) {
+  if (!DELIVERY_EVENTS.includes(input.event as DeliveryEvent)) {
+    throw new Error(`Unsupported delivery event: ${input.event}`)
+  }
+  if (!DELIVERY_CHANNELS.includes(input.channel as DeliveryChannel)) {
+    throw new Error(`Unsupported delivery channel: ${input.channel}`)
+  }
+  const event = input.event as DeliveryEvent
+  const channel = input.channel as DeliveryChannel
+  const payload = asRecord(input.payload)
+
+  if (channel === 'sms') {
+    const message = String(payload?.message ?? payload?.body ?? 'Safety notification')
+    return deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'sms',
+      target: input.target,
+      payload: (payload ?? { message }) as Prisma.JsonValue,
+      send: async () => {
+        await sendTextSms(input.target, message)
+      }
+    })
+  }
+
+  if (channel === 'email') {
+    const subject = String(payload?.subject ?? 'Safety Notification')
+    const body = String(payload?.body ?? payload?.message ?? 'Safety notification')
+    return deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'email',
+      target: input.target,
+      payload: (payload ?? { subject, body }) as Prisma.JsonValue,
+      send: async () => {
+        await sendEmail(input.target, subject, body)
+      }
+    })
+  }
+
+  const webhookPayload = payload ?? {}
+  return deliverWithRetry({
+    incidentId: input.incidentId,
+    event,
+    channel: 'webhook',
+    target: input.target,
+    payload: webhookPayload as Prisma.JsonValue,
+    send: async () => {
+      const result = await postWebhook(webhookPayload)
+      if (!result.sent) {
+        throw new Error('Webhook URL not configured')
+      }
+    }
+  })
 }
 
 export async function notifySafetyResolution(input: {
@@ -211,6 +419,7 @@ export async function notifySafetyResolution(input: {
   reporter?: { phone?: string | null; email?: string | null }
 }) {
   const templates = await getSafetyTemplates()
+  const event: DeliveryEvent = 'safety.resolved'
   const vars = {
     incidentId: input.incidentId,
     status: input.status,
@@ -222,44 +431,75 @@ export async function notifySafetyResolution(input: {
   const subject = renderTemplate(tpl.subject, vars)
   const body = renderTemplate(tpl.body, vars)
 
-  const results: Array<{ channel: string; target: string; ok: boolean; error?: string }> = []
+  const results: Array<{ channel: string; target: string; ok: boolean; attempts: number; error?: string }> = []
 
   if (input.reporter?.phone) {
-    try {
-      await sendTextSms(input.reporter.phone, `${subject} - ${body}`)
-      results.push({ channel: 'sms', target: input.reporter.phone, ok: true })
-    } catch (err) {
-      results.push({ channel: 'sms', target: input.reporter.phone, ok: false, error: err instanceof Error ? err.message : 'send failed' })
-    }
+    const message = `${subject} - ${body}`
+    results.push(await deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'sms',
+      target: input.reporter.phone,
+      payload: { message, audience: 'reporter' },
+      send: async () => {
+        await sendTextSms(input.reporter!.phone!, message)
+      }
+    }))
   }
 
   if (input.reporter?.email) {
-    try {
-      await sendEmailStub(input.reporter.email, subject, body)
-      results.push({ channel: 'email', target: input.reporter.email, ok: true })
-    } catch (err) {
-      results.push({ channel: 'email', target: input.reporter.email, ok: false, error: err instanceof Error ? err.message : 'send failed' })
-    }
+    results.push(await deliverWithRetry({
+      incidentId: input.incidentId,
+      event,
+      channel: 'email',
+      target: input.reporter.email,
+      payload: { subject, body, audience: 'reporter' },
+      send: async () => {
+        await sendEmail(input.reporter!.email!, subject, body)
+      }
+    }))
   }
 
-  try {
-    const webhookResult = await postWebhook({
-      event: 'safety.resolved',
+  const webhookPayload = {
+    event,
+    incidentId: input.incidentId,
+    status: input.status,
+    action: input.action,
+    note: input.note ?? null
+  }
+  if (getWebhookUrl()) {
+    const target = getWebhookUrl() || 'configured'
+    results.push(await deliverWithRetry({
       incidentId: input.incidentId,
-      status: input.status,
-      action: input.action,
-      note: input.note ?? null
+      event,
+      channel: 'webhook',
+      target,
+      payload: webhookPayload,
+      send: async () => {
+        const webhookResult = await postWebhook(webhookPayload)
+        if (!webhookResult.sent) {
+          throw new Error('Webhook URL not configured')
+        }
+      }
+    }))
+  } else {
+    await createSafetyDeliveryLog({
+      incidentId: input.incidentId,
+      event,
+      channel: 'webhook',
+      target: 'not-configured',
+      status: 'DEAD_LETTER',
+      attempts: 1,
+      lastError: 'Webhook URL not configured',
+      payload: webhookPayload
     })
-    if (webhookResult.sent) {
-      results.push({ channel: 'webhook', target: getWebhookUrl() || 'configured', ok: true })
-    }
-  } catch (err) {
-    results.push({ channel: 'webhook', target: getWebhookUrl() || 'configured', ok: false, error: err instanceof Error ? err.message : 'send failed' })
+    results.push({ channel: 'webhook', target: 'not-configured', ok: false, attempts: 1, error: 'Webhook URL not configured' })
   }
 
   return {
     delivered: results.filter((x) => x.ok).length,
     attempted: results.length,
+    deadLetters: results.filter((x) => !x.ok).length,
     results
   }
 }

@@ -6,7 +6,7 @@ import { getAuthContext, requireAdmin } from '../lib/auth.js'
 import { ADMIN_TARGET_STATUSES, appendAdminStatusNote, canTransitionApplicationStatus } from '../lib/admin-driver-applications.js'
 import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment.js'
 import { getIo } from '../socket.js'
-import { getSafetyTemplates, notifySafetyEscalation, notifySafetyResolution, SAFETY_TEMPLATE_KEYS, updateSafetyTemplate } from '../services/safety-notifier.js'
+import { getSafetyTemplates, notifySafetyEscalation, notifySafetyResolution, retrySafetyDeliveryLog, SAFETY_TEMPLATE_KEYS, updateSafetyTemplate } from '../services/safety-notifier.js'
 
 const router = Router()
 router.use(requireAdmin)
@@ -22,6 +22,8 @@ const REVENUE_PAYMENT_STATUSES = ['PAID', 'VERIFIED'] as const
 const SAFETY_INCIDENT_CATEGORIES = ['SOS', 'SAFETY'] as const
 const SAFETY_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const
 const SAFETY_TIMELINE_EVENT_TYPES = ['SOS_TRIGGERED', 'ADMIN_SAFETY_ACKNOWLEDGED', 'ADMIN_SAFETY_ASSIGNED', 'ADMIN_SAFETY_ESCALATED', 'ADMIN_SAFETY_RESOLVED', 'ADMIN_SAFETY_CLOSED'] as const
+const SAFETY_DELIVERY_STATUSES = ['DELIVERED', 'DEAD_LETTER'] as const
+const SAFETY_DELIVERY_CHANNELS = ['sms', 'email', 'webhook'] as const
 
 function parseBooleanQuery(value: unknown) {
   if (typeof value === 'boolean') return value
@@ -910,6 +912,78 @@ router.put('/safety/templates/:key', async (req, res) => {
       ...updated
     }
   })
+})
+
+router.get('/safety/delivery-logs', async (req, res) => {
+  const parsed = z.object({
+    incidentId: z.string().trim().min(1).optional(),
+    status: z.enum(SAFETY_DELIVERY_STATUSES).optional(),
+    channel: z.enum(SAFETY_DELIVERY_CHANNELS).optional(),
+    q: z.string().trim().min(1).max(120).optional(),
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20)
+  }).safeParse(req.query)
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
+
+  const where = {
+    ...(parsed.data.incidentId ? { incidentId: parsed.data.incidentId } : {}),
+    ...(parsed.data.status ? { status: parsed.data.status } : {}),
+    ...(parsed.data.channel ? { channel: parsed.data.channel } : {}),
+    ...(parsed.data.q
+      ? {
+        OR: [
+          { id: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { incidentId: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { target: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { lastError: { contains: parsed.data.q, mode: 'insensitive' as const } }
+        ]
+      }
+      : {})
+  }
+
+  const skip = (parsed.data.page - 1) * parsed.data.limit
+  const [items, total] = await Promise.all([
+    prisma.safetyDeliveryLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parsed.data.limit
+    }),
+    prisma.safetyDeliveryLog.count({ where })
+  ])
+
+  return res.json({
+    items,
+    page: parsed.data.page,
+    limit: parsed.data.limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / parsed.data.limit))
+  })
+})
+
+router.post('/safety/delivery-logs/:id/retry', async (req, res) => {
+  const log = await prisma.safetyDeliveryLog.findUnique({
+    where: { id: req.params.id }
+  })
+  if (!log) return res.status(404).json({ error: 'Delivery log not found' })
+  if (log.status !== 'DEAD_LETTER') {
+    return res.status(409).json({ error: 'Only dead-lettered deliveries can be retried' })
+  }
+  if (!['safety.escalated', 'safety.resolved'].includes(log.event)) {
+    return res.status(422).json({ error: `Unsupported delivery event: ${log.event}` })
+  }
+  if (!['sms', 'email', 'webhook'].includes(log.channel)) {
+    return res.status(422).json({ error: `Unsupported delivery channel: ${log.channel}` })
+  }
+
+  const retry = await retrySafetyDeliveryLog({
+    incidentId: log.incidentId,
+    event: log.event,
+    channel: log.channel,
+    target: log.target,
+    payload: log.payload
+  })
+  return res.json({ ok: true, retry })
 })
 
 router.get('/safety/incidents', async (req, res) => {
