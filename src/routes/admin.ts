@@ -1035,15 +1035,45 @@ router.get('/audit-logs', async (req, res) => {
     action: z.string().trim().min(1).max(120).optional(),
     targetType: z.string().trim().min(1).max(120).optional(),
     q: z.string().trim().min(1).max(120).optional(),
+    from: z.string().trim().min(1).optional(),
+    to: z.string().trim().min(1).optional(),
     page: z.coerce.number().int().min(1).default(1),
     limit: z.coerce.number().int().min(1).max(100).default(20)
   }).safeParse(req.query)
   if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
 
+  const parseDateParam = (value: string, mode: 'start' | 'end') => {
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value)
+    const normalized = isDateOnly ? `${value}${mode === 'start' ? 'T00:00:00.000Z' : 'T23:59:59.999Z'}` : value
+    const date = new Date(normalized)
+    if (Number.isNaN(date.getTime())) return null
+    return date
+  }
+
+  const fromDate = parsed.data.from ? parseDateParam(parsed.data.from, 'start') : null
+  if (parsed.data.from && !fromDate) {
+    return res.status(422).json({ error: 'Invalid from date. Use ISO datetime or YYYY-MM-DD.' })
+  }
+
+  const toDate = parsed.data.to ? parseDateParam(parsed.data.to, 'end') : null
+  if (parsed.data.to && !toDate) {
+    return res.status(422).json({ error: 'Invalid to date. Use ISO datetime or YYYY-MM-DD.' })
+  }
+
+  if (fromDate && toDate && fromDate.getTime() > toDate.getTime()) {
+    return res.status(422).json({ error: 'Invalid date range: from must be before to.' })
+  }
+
+  const createdAtWhere = {
+    ...(fromDate ? { gte: fromDate } : {}),
+    ...(toDate ? { lte: toDate } : {})
+  }
+
   const where = {
     ...(parsed.data.actorId ? { adminId: parsed.data.actorId } : {}),
     ...(parsed.data.action ? { action: parsed.data.action } : {}),
     ...(parsed.data.targetType ? { targetType: parsed.data.targetType } : {}),
+    ...(Object.keys(createdAtWhere).length > 0 ? { createdAt: createdAtWhere } : {}),
     ...(parsed.data.q
       ? {
         OR: [

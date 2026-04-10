@@ -1116,24 +1116,46 @@ test('GET /admin/audit-logs applies filters and pagination', async () => {
   }
 
   const res = await request(app)
-    .get('/admin/audit-logs?actorId=admin-1&action=SAFETY_ESCALATE&targetType=SAFETY_INCIDENT&q=critical&page=1&limit=20')
+    .get('/admin/audit-logs?actorId=admin-1&action=SAFETY_ESCALATE&targetType=SAFETY_INCIDENT&q=critical&from=2026-04-01&to=2026-04-10&page=1&limit=20')
     .set('Authorization', `Bearer ${token}`)
 
   assert.equal(res.status, 200)
-  assert.deepEqual(capturedWhere, {
-    adminId: 'admin-1',
-    action: 'SAFETY_ESCALATE',
-    targetType: 'SAFETY_INCIDENT',
-    OR: [
-      { id: { contains: 'critical', mode: 'insensitive' } },
-      { targetId: { contains: 'critical', mode: 'insensitive' } },
-      { summary: { contains: 'critical', mode: 'insensitive' } },
-      { action: { contains: 'critical', mode: 'insensitive' } },
-      { targetType: { contains: 'critical', mode: 'insensitive' } },
-      { admin: { name: { contains: 'critical', mode: 'insensitive' } } },
-      { admin: { phone: { contains: 'critical', mode: 'insensitive' } } }
-    ]
+  const where = capturedWhere as any
+  assert.equal(where.adminId, 'admin-1')
+  assert.equal(where.action, 'SAFETY_ESCALATE')
+  assert.equal(where.targetType, 'SAFETY_INCIDENT')
+  assert.equal(where.createdAt.gte.toISOString(), '2026-04-01T00:00:00.000Z')
+  assert.equal(where.createdAt.lte.toISOString(), '2026-04-10T23:59:59.999Z')
+  assert.deepEqual(where.OR, [
+    { id: { contains: 'critical', mode: 'insensitive' } },
+    { targetId: { contains: 'critical', mode: 'insensitive' } },
+    { summary: { contains: 'critical', mode: 'insensitive' } },
+    { action: { contains: 'critical', mode: 'insensitive' } },
+    { targetType: { contains: 'critical', mode: 'insensitive' } },
+    { admin: { name: { contains: 'critical', mode: 'insensitive' } } },
+    { admin: { phone: { contains: 'critical', mode: 'insensitive' } } }
+  ])
+})
+
+test('GET /admin/audit-logs rejects invalid date range', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
   })
+
+  ;(prisma as any).adminAuditLog = {
+    findMany: async () => [],
+    count: async () => 0
+  }
+
+  const res = await request(app)
+    .get('/admin/audit-logs?from=2026-04-10&to=2026-04-01&page=1&limit=20')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 422)
+  assert.equal(res.body.error, 'Invalid date range: from must be before to.')
 })
 
 test('POST /admin/safety/delivery-logs/:id/retry retries dead-letter log', async () => {
