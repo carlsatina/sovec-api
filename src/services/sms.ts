@@ -82,3 +82,55 @@ export async function sendOtpSms(phone: string, code: string) {
   }
   return { provider: 'semaphore' as const, sid: String(first.message_id ?? '') }
 }
+
+export async function sendTextSms(phone: string, message: string) {
+  const config = getSmsConfig()
+  if (config.provider === 'mock') {
+    console.log(`[sms:mock] ${message} -> ${phone}`)
+    return { provider: 'mock' as const, sid: 'mock' }
+  }
+
+  const apiKey = config.semaphoreApiKey
+  if (!apiKey) {
+    throw new Error('Semaphore SMS provider is not fully configured')
+  }
+
+  const number = toSemaphoreNumber(phone)
+  const body = new URLSearchParams({
+    apikey: apiKey,
+    number,
+    message
+  })
+  if (config.semaphoreSenderName) {
+    body.set('sendername', config.semaphoreSenderName)
+  }
+
+  const res = await fetch('https://api.semaphore.co/api/v4/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Semaphore send failed (${res.status}): ${text}`)
+  }
+
+  const json = await res.json() as
+    | Array<{ message_id?: number; status?: string; recipient?: string; message?: string; error?: string }>
+    | { message_id?: number; status?: string; recipient?: string; message?: string; error?: string }
+
+  const first = Array.isArray(json) ? json[0] : json
+  if (!first) {
+    throw new Error(`Semaphore did not return a message payload: ${JSON.stringify(json)}`)
+  }
+
+  const status = String(first.status ?? '').toLowerCase()
+  if (status === 'failed' || status === 'rejected') {
+    throw new Error(`Semaphore rejected SMS: ${first.error ?? JSON.stringify(first)}`)
+  }
+
+  return { provider: 'semaphore' as const, sid: String(first.message_id ?? '') }
+}

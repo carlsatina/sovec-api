@@ -50,6 +50,7 @@ router.get('/:id', async (req, res) => {
 })
 
 const VALID_STATUSES = ['FINDING_DRIVER', 'ASSIGNED', 'ARRIVING', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'] as const
+const SOS_ELIGIBLE_STATUSES = new Set(['ASSIGNED', 'ARRIVING', 'IN_PROGRESS'])
 const DRIVER_CONTROLLED_STATUSES = new Set(['ARRIVING', 'IN_PROGRESS', 'COMPLETED'])
 const NEXT_STATUSES: Record<string, Array<(typeof VALID_STATUSES)[number]>> = {
   REQUESTED: ['FINDING_DRIVER', 'CANCELLED'],
@@ -181,6 +182,95 @@ router.post('/:id/rate', requireAuth, async (req, res) => {
   })
 
   return res.json({ ok: true, id: event.id })
+})
+
+router.post('/:id/sos', requireAuth, async (req, res) => {
+  const auth = getAuthContext(res)
+  const parsed = z.object({
+    severity: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('HIGH'),
+    note: z.string().trim().max(500).optional()
+  }).safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(422).json({ error: parsed.error.flatten() })
+  }
+
+  const ride = await prisma.ride.findUnique({
+    where: { id: req.params.id },
+    select: { id: true, riderId: true, driverId: true, status: true }
+  })
+  if (!ride) return res.status(404).json({ error: 'Ride not found' })
+  if (!SOS_ELIGIBLE_STATUSES.has(ride.status)) {
+    return res.status(409).json({ error: `SOS is only available for active rides. Current status: ${ride.status}` })
+  }
+
+  const isRider = ride.riderId === auth.userId
+  const isDriver = ride.driverId === auth.userId
+  if (!isRider && !isDriver) {
+    return res.status(403).json({ error: 'Only assigned rider or driver can trigger SOS for this ride' })
+  }
+
+  const reporterRole = isDriver ? 'DRIVER' : 'PASSENGER'
+  const note = parsed.data.note?.trim() || null
+
+  const [incident, event] = await prisma.$transaction(async (tx) => {
+    const nextIncident = await tx.supportTicket.create({
+      data: {
+        userId: auth.userId,
+        category: 'SOS',
+        status: 'OPEN',
+        description: `[META]${JSON.stringify({
+          rideId: ride.id,
+          severity: parsed.data.severity,
+          reporterRole,
+          priority: parsed.data.severity,
+          assigneeId: null,
+          acknowledgedAt: null,
+          resolvedAt: null
+        })}\n${note ?? ''}`
+      }
+    })
+
+    const nextEvent = await tx.rideEvent.create({
+      data: {
+        rideId: ride.id,
+        type: 'SOS_TRIGGERED',
+        metadata: {
+          incidentId: nextIncident.id,
+          reporterId: auth.userId,
+          reporterRole,
+          severity: parsed.data.severity,
+          note
+        }
+      }
+    })
+
+    return [nextIncident, nextEvent]
+  })
+
+  try {
+    const io = getIo()
+    io.to(`ride:${ride.id}`).emit('ride:sos', {
+      rideId: ride.id,
+      incidentId: incident.id,
+      reporterRole,
+      severity: parsed.data.severity
+    })
+    io.to('admins').emit('admin:safety:sos', {
+      rideId: ride.id,
+      incidentId: incident.id,
+      reporterRole,
+      severity: parsed.data.severity
+    })
+  } catch {
+    // Allow SOS creation to succeed even when socket transport is unavailable.
+  }
+
+  return res.status(201).json({
+    ok: true,
+    incidentId: incident.id,
+    rideEventId: event.id,
+    status: incident.status
+  })
 })
 
 router.post('/:id/events', async (req, res) => {

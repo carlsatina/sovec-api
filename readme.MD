@@ -37,6 +37,10 @@ cp .env.example .env
   - `SEMAPHORE_API_KEY`
   - `SEMAPHORE_SENDER_NAME` (optional)
   - `SEMAPHORE_OTP_MESSAGE` (optional, supports `{otp}` placeholder)
+- Safety escalation channels (optional):
+  - `SAFETY_ESCALATION_PHONES` (comma-separated phone numbers for SMS alerts)
+  - `SAFETY_ESCALATION_EMAILS` (comma-separated email recipients; currently stub-logged)
+  - `SAFETY_ESCALATION_WEBHOOK_URL` (POST webhook endpoint for escalation/resolution events)
 
 ## Database Workflow
 ```bash
@@ -70,14 +74,14 @@ Use this to validate the auth flow end-to-end:
 
 Run:
 ```bash
-SMOKE_PHONE=+639171111111 npm run smoke:auth
+SMOKE_PHONE=+639171111111 npm run smoke
 ```
 
 Notes:
 - For `SMS_PROVIDER=mock`, the script auto-uses `debugCode`.
 - For real SMS providers, pass the received OTP:
 ```bash
-SMOKE_PHONE=+639171111111 SMOKE_OTP_CODE=123456 npm run smoke:auth
+SMOKE_PHONE=+639171111111 SMOKE_OTP_CODE=123456 npm run smoke
 ```
 - Optional: `API_URL=http://localhost:4000` (defaults to this value).
 
@@ -118,6 +122,22 @@ Health check endpoint:
 - `POST /admin/rides/:id/reassign`
   - Body: `{ reason?, preferredDriverId? }`
   - Reassigns active ride; can target a preferred available driver
+- `GET /admin/payments`
+  - Query params:
+    - `status`: `PENDING | PAID | VERIFIED | FAILED | REFUND_PENDING | REFUNDED`
+    - `method`: `CASH | EWALLET | CARD`
+    - `q`: search on payment/ride/ref/rider/driver fields
+    - `page`: default `1`
+    - `limit`: default `20`, max `100`
+- `POST /admin/payments/:id/verify`
+  - Body: `{ note? }`
+  - Sets payment status to `VERIFIED` and logs an admin payment event
+- `POST /admin/payments/:id/fail`
+  - Body: `{ reason? }`
+  - Sets payment status to `FAILED` and logs an admin payment event
+- `POST /admin/payments/:id/refund`
+  - Body: `{ reason, amount? }`
+  - Creates manual refund record by moving status to `REFUND_PENDING` and logging admin refund request event
 - `GET /admin/pricing`
   - Returns the current fare configuration singleton
 - `PUT /admin/pricing`
@@ -138,13 +158,79 @@ Health check endpoint:
   - Use `null`/empty to unassign vehicle driver
 - `POST /admin/vehicles/:id/status`
   - Body: `{ status, batteryLevel? }`
+- `GET /admin/support/tickets`
+  - Query params:
+    - `status`: `OPEN | IN_REVIEW | RESOLVED | CLOSED`
+    - `category`: text filter
+    - `q`: search on id/category/description/user fields
+    - `page`: default `1`
+    - `limit`: default `20`, max `100`
+- `POST /admin/support/tickets/:id/status`
+  - Body: `{ status, note? }`
+  - Sends a support update notification to the ticket owner
+- `GET /admin/safety/incidents`
+  - Query params:
+    - `status`: `OPEN | IN_REVIEW | RESOLVED | CLOSED`
+    - `priority`: `LOW | MEDIUM | HIGH | CRITICAL`
+    - `assigneeId`: admin user id
+    - `overdue`: `true | false`
+    - `q`: text filter
+    - `activeOnly`: default `true` (returns `OPEN` + `IN_REVIEW` when no status provided)
+    - `page`: default `1`
+    - `limit`: default `20`, max `100`
+  - Response includes enriched fields:
+    - `incidentMeta` (priority, assignee, acknowledge/resolve timestamps, parsed note)
+    - `timeline` (safety lifecycle events)
+    - `sla` (ack/resolve durations + overdue flag)
+- `GET /admin/safety/templates`
+  - Returns notification templates used for safety escalation/resolution channel messages
+  - Templates are persisted in DB table `SafetyTemplate` (not runtime memory)
+- `PUT /admin/safety/templates/:key`
+  - Keys: `ESCALATION_ADMIN | ESCALATION_REPORTER | RESOLUTION_REPORTER`
+  - Body: `{ subject?, body? }`
+- `POST /admin/safety/incidents/:id/resolve`
+  - Body: `{ status: RESOLVED|CLOSED, action, note? }`
+  - Updates incident status, app notification, and escalation-channel fan-out (SMS/email/webhook)
+- `POST /admin/safety/incidents/:id/acknowledge`
+  - Body: `{ note? }`
+  - Marks incident `IN_REVIEW` and records acknowledgement metadata
+- `POST /admin/safety/incidents/:id/assign`
+  - Body: `{ assigneeId?, note? }`
+  - Assigns incident to an admin (defaults to current admin)
+- `POST /admin/safety/incidents/:id/escalate`
+  - Body: `{ priority: LOW|MEDIUM|HIGH|CRITICAL, reason }`
+  - Updates incident priority, records escalation metadata, and triggers channel fan-out
+- `GET /admin/analytics/overview`
+  - Returns:
+    - `today`: rides, completed/cancelled rides, revenue
+    - `activeDrivers`: currently available drivers
+    - `rolling30d`: rides, revenue, completion/cancellation rates
+- `GET /admin/analytics/trends`
+  - Query params:
+    - `days`: integer `1..90` (default `7`)
+  - Returns daily buckets with `rides`, `completedRides`, `cancelledRides`, `revenue`
 
 Fare computation (`/bookings/estimate` and booking creation) now uses the persisted admin pricing config.
 
+SOS API:
+- `POST /rides/:id/sos` (authenticated rider/driver only)
+  - Body: `{ severity: LOW|MEDIUM|HIGH|CRITICAL, note? }`
+  - Creates a safety incident ticket and `SOS_TRIGGERED` ride event
+
 ## Smoke Tests
-- Auth smoke test:
-  - `SMOKE_PHONE=+639171111111 npm run smoke:auth`
-- Admin fleet smoke test:
-  - `ADMIN_TOKEN=<admin-jwt> npm run smoke:admin:fleet`
-  - Optional assignment check:
-    - `SMOKE_DRIVER_ID=<driver-user-id> ADMIN_TOKEN=<admin-jwt> npm run smoke:admin:fleet`
+- Single command:
+  - `npm run smoke`
+- Default auto-selection:
+  - Runs `auth` when `SMOKE_PHONE` is set
+  - Runs admin suites (`admin-fleet`, `admin-support`, `admin-analytics`, `admin-safety`) when `ADMIN_TOKEN` is set
+- Explicit suite selection:
+  - `SMOKE_SUITES=auth npm run smoke`
+  - `SMOKE_SUITES=admin-fleet,admin-support npm run smoke`
+  - `SMOKE_SUITES=admin-analytics SMOKE_ANALYTICS_DAYS=30 npm run smoke`
+  - `SMOKE_SUITES=admin-safety ADMIN_TOKEN=<admin-jwt> npm run smoke`
+- Suite-specific env vars:
+  - Auth: `SMOKE_PHONE`, optional `SMOKE_OTP_CODE`
+  - Admin fleet: `ADMIN_TOKEN`, optional `SMOKE_DRIVER_ID`
+  - Admin support: `ADMIN_TOKEN`, optional `SMOKE_SUPPORT_TICKET_ID`, optional `SMOKE_SUPPORT_CATEGORY`
+  - Admin analytics: `ADMIN_TOKEN`, optional `SMOKE_ANALYTICS_DAYS`
+  - Admin safety: `ADMIN_TOKEN`, optional `SMOKE_SAFETY_INCIDENT_ID`

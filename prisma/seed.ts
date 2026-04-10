@@ -257,6 +257,54 @@ async function main() {
       currency: 'PHP'
     }
   })
+
+  await prisma.safetyTemplate.upsert({
+    where: { key: 'ESCALATION_ADMIN' },
+    update: {},
+    create: {
+      key: 'ESCALATION_ADMIN',
+      subject: 'Safety Escalation {{incidentId}} ({{priority}})',
+      body: 'Incident {{incidentId}} has been escalated to {{priority}}. Reason: {{reason}}. Ride: {{rideId}}.'
+    }
+  })
+  await prisma.safetyTemplate.upsert({
+    where: { key: 'ESCALATION_REPORTER' },
+    update: {},
+    create: {
+      key: 'ESCALATION_REPORTER',
+      subject: 'Your Safety Incident Is Escalated',
+      body: 'Your incident {{incidentId}} is now {{priority}} priority. The team is actively handling this case.'
+    }
+  })
+  await prisma.safetyTemplate.upsert({
+    where: { key: 'RESOLUTION_REPORTER' },
+    update: {},
+    create: {
+      key: 'RESOLUTION_REPORTER',
+      subject: 'Safety Incident {{incidentId}} Update',
+      body: 'Your safety incident {{incidentId}} was marked {{status}}. Action: {{action}}. Note: {{note}}.'
+    }
+  })
+
+  const supportTicketCount = await prisma.supportTicket.count()
+  if (supportTicketCount === 0) {
+    await prisma.supportTicket.createMany({
+      data: [
+        {
+          userId: passenger.id,
+          category: 'SAFETY',
+          description: 'Driver took an unexpected route and rider requested a safety check.',
+          status: 'OPEN'
+        },
+        {
+          userId: passenger.id,
+          category: 'PAYMENT',
+          description: 'Cash payment marked as unpaid in app after trip completion.',
+          status: 'IN_REVIEW'
+        }
+      ]
+    })
+  }
 }
 
 main()

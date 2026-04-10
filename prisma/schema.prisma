@@ -255,3 +255,10 @@ model FareConfig {
   currency      String   @default("PHP")
   updatedAt     DateTime @updatedAt
 }
+
+model SafetyTemplate {
+  key       String   @id
+  subject   String
+  body      String
+  updatedAt DateTime @updatedAt
+}
