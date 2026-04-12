@@ -114,6 +114,7 @@ router.get('/route', async (req, res) => {
   const originLng = Number(req.query.originLng)
   const destinationLat = Number(req.query.destinationLat)
   const destinationLng = Number(req.query.destinationLng)
+  const optimal = req.query.optimal === 'true'
 
   if (
     !Number.isFinite(originLat) ||
@@ -126,35 +127,55 @@ router.get('/route', async (req, res) => {
 
   if (!GOOGLE_API_KEY) return res.status(500).json({ error: 'missing api key' })
 
-  const url = new URL('https://maps.googleapis.com/maps/api/directions/json')
-  url.searchParams.set('origin', `${originLat},${originLng}`)
-  url.searchParams.set('destination', `${destinationLat},${destinationLng}`)
-  url.searchParams.set('mode', 'driving')
-  url.searchParams.set('alternatives', 'false')
-  url.searchParams.set('key', GOOGLE_API_KEY)
+  const routingPreference = optimal ? 'TRAFFIC_AWARE_OPTIMAL' : 'TRAFFIC_AWARE'
 
   let data: any
   try {
-    const response = await fetch(url)
+    const response = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_API_KEY,
+        'X-Goog-FieldMask': `routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline${optimal ? ',routes.travelAdvisory.tollInfo' : ''}`
+      },
+      body: JSON.stringify({
+        origin: { location: { latLng: { latitude: originLat, longitude: originLng } } },
+        destination: { location: { latLng: { latitude: destinationLat, longitude: destinationLng } } },
+        travelMode: 'DRIVE',
+        routingPreference,
+        departureTime: new Date().toISOString(),
+        ...(optimal ? { extraComputations: ['TOLLS'] } : {})
+      })
+    })
     data = await response.json()
   } catch (err) {
     return res.status(502).json({ error: 'upstream_error', message: String(err) })
   }
 
-  if (data.status !== 'OK') {
-    return res.status(502).json({ error: data.status, message: data.error_message })
+  if (data.error) {
+    return res.status(502).json({ error: data.error.status ?? 'ROUTES_API_ERROR', message: data.error.message })
   }
 
   const route = data.routes?.[0]
-  const leg = route?.legs?.[0]
-  if (!route || !leg) {
+  if (!route) {
+    console.error('[geo/route] unexpected Routes API response:', JSON.stringify(data))
     return res.status(502).json({ error: 'INVALID_ROUTE_RESPONSE' })
   }
 
+  // Routes API v2 returns duration as a protobuf string e.g. "1234s"
+  const durationSeconds = parseInt(route.duration ?? '0', 10)
+
+  // Parse toll estimate — Money type: units (int64 string) + nanos (fractional)
+  const tollPrice = route.travelAdvisory?.tollInfo?.estimatedPrice?.[0]
+  const tollEstimate = tollPrice
+    ? Number(tollPrice.units ?? 0) + (tollPrice.nanos ?? 0) / 1e9
+    : 0
+
   return res.json({
-    polyline: route.overview_polyline?.points ?? '',
-    distanceMeters: leg.distance?.value ?? 0,
-    durationSeconds: leg.duration?.value ?? 0
+    polyline: route.polyline?.encodedPolyline ?? '',
+    distanceMeters: route.distanceMeters ?? 0,
+    durationSeconds,
+    tollEstimate
   })
 })
 
