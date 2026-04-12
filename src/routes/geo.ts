@@ -143,7 +143,6 @@ router.get('/route', async (req, res) => {
         destination: { location: { latLng: { latitude: destinationLat, longitude: destinationLng } } },
         travelMode: 'DRIVE',
         routingPreference,
-        departureTime: new Date().toISOString(),
         ...(optimal ? { extraComputations: ['TOLLS'] } : {})
       })
     })
