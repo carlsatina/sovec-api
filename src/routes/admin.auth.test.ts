@@ -2,7 +2,7 @@ import test, { afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import express from 'express'
 import request from 'supertest'
-import { readFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import adminRoutes from './admin.js'
 import { signAuthToken } from '../lib/auth.js'
 import prisma from '../db.js'
@@ -269,6 +269,18 @@ test('GET /admin/audit-logs/export.csv requires auth token', async () => {
   assert.equal(res.status, 401)
 })
 
+test('GET /admin/audit-logs/dead-letters requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).get('/admin/audit-logs/dead-letters')
+  assert.equal(res.status, 401)
+})
+
+test('POST /admin/audit-logs/dead-letters/:id/replay requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).post('/admin/audit-logs/dead-letters/dead-id/replay')
+  assert.equal(res.status, 401)
+})
+
 test('GET /admin/audit-logs requires ADMIN role', async () => {
   const app = createTestApp()
   const token = signAuthToken({
@@ -294,6 +306,36 @@ test('GET /admin/audit-logs/export.csv requires ADMIN role', async () => {
 
   const res = await request(app)
     .get('/admin/audit-logs/export.csv')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
+})
+
+test('GET /admin/audit-logs/dead-letters requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .get('/admin/audit-logs/dead-letters')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
+})
+
+test('POST /admin/audit-logs/dead-letters/:id/replay requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .post('/admin/audit-logs/dead-letters/dead-id/replay')
     .set('Authorization', `Bearer ${token}`)
 
   assert.equal(res.status, 403)
@@ -1450,6 +1492,150 @@ test('GET /admin/audit-logs/export.csv returns csv rows for filtered logs', asyn
   assert.equal(res.text.includes('"log-1"'), true)
   assert.equal(res.text.includes('"PAYMENT_VERIFY"'), true)
   assert.equal(res.text.includes('"\'=cmd|\' /C calc\'!A0"'), true)
+})
+
+test('GET /admin/audit-logs/dead-letters returns paginated parsed entries', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const tempPath = `/tmp/eride-admin-audit-dead-letter-test-${Date.now()}.ndjson`
+  const previousPath = process.env.ADMIN_AUDIT_DEAD_LETTER_PATH
+  process.env.ADMIN_AUDIT_DEAD_LETTER_PATH = tempPath
+
+  try {
+    await writeFile(tempPath, [
+      JSON.stringify({
+        capturedAt: '2026-04-12T10:00:00.000Z',
+        payload: {
+          adminId: 'admin-1',
+          action: 'PAYMENT_VERIFY',
+          targetType: 'PAYMENT',
+          targetId: 'pay-1',
+          summary: 'Verify failed',
+          metadata: { note: 'network timeout' }
+        },
+        error: 'db timeout'
+      }),
+      JSON.stringify({
+        capturedAt: '2026-04-12T11:00:00.000Z',
+        payload: {
+          adminId: 'admin-2',
+          action: 'FLEET_UPDATE_STATUS',
+          targetType: 'VEHICLE',
+          targetId: 'veh-2',
+          summary: 'Status update failed'
+        },
+        error: 'connection dropped'
+      })
+    ].join('\n'))
+
+    const res = await request(app)
+      .get('/admin/audit-logs/dead-letters?action=PAYMENT_VERIFY&page=1&limit=20')
+      .set('Authorization', `Bearer ${token}`)
+
+    assert.equal(res.status, 200)
+    assert.equal(res.body.path, tempPath)
+    assert.equal(res.body.total, 1)
+    assert.equal(Array.isArray(res.body.items), true)
+    assert.equal(res.body.items[0].action, 'PAYMENT_VERIFY')
+    assert.equal(res.body.items[0].targetType, 'PAYMENT')
+    assert.equal(res.body.items[0].error, 'db timeout')
+  } finally {
+    if (typeof previousPath === 'string') {
+      process.env.ADMIN_AUDIT_DEAD_LETTER_PATH = previousPath
+    } else {
+      delete process.env.ADMIN_AUDIT_DEAD_LETTER_PATH
+    }
+    await rm(tempPath, { force: true }).catch(() => {})
+  }
+})
+
+test('POST /admin/audit-logs/dead-letters/:id/replay replays once and marks status', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const base = `/tmp/eride-admin-audit-replay-test-${Date.now()}`
+  const tempPath = `${base}.ndjson`
+  const tempStatusPath = `${base}.status.json`
+  const previousPath = process.env.ADMIN_AUDIT_DEAD_LETTER_PATH
+  const previousStatusPath = process.env.ADMIN_AUDIT_DEAD_LETTER_STATUS_PATH
+  process.env.ADMIN_AUDIT_DEAD_LETTER_PATH = tempPath
+  process.env.ADMIN_AUDIT_DEAD_LETTER_STATUS_PATH = tempStatusPath
+
+  let createCalls = 0
+  ;(prisma as any).adminAuditLog = {
+    create: async (args: any) => {
+      createCalls += 1
+      assert.equal(args.data.action, 'PAYMENT_VERIFY')
+      return { id: 'audit-replayed-1' }
+    }
+  }
+
+  try {
+    await writeFile(tempPath, JSON.stringify({
+      capturedAt: '2026-04-12T10:00:00.000Z',
+      payload: {
+        adminId: 'admin-1',
+        action: 'PAYMENT_VERIFY',
+        targetType: 'PAYMENT',
+        targetId: 'pay-1',
+        summary: 'Verify failed',
+        metadata: { note: 'network timeout' }
+      },
+      error: 'db timeout'
+    }))
+
+    const listBefore = await request(app)
+      .get('/admin/audit-logs/dead-letters')
+      .set('Authorization', `Bearer ${token}`)
+    assert.equal(listBefore.status, 200)
+    assert.equal(listBefore.body.items.length, 1)
+    const deadId = listBefore.body.items[0].id as string
+
+    const replay = await request(app)
+      .post(`/admin/audit-logs/dead-letters/${deadId}/replay`)
+      .set('Authorization', `Bearer ${token}`)
+    assert.equal(replay.status, 200)
+    assert.equal(replay.body.ok, true)
+    assert.equal(replay.body.replayed, true)
+    assert.equal(createCalls, 1)
+
+    const replayAgain = await request(app)
+      .post(`/admin/audit-logs/dead-letters/${deadId}/replay`)
+      .set('Authorization', `Bearer ${token}`)
+    assert.equal(replayAgain.status, 200)
+    assert.equal(replayAgain.body.replayed, false)
+    assert.equal(replayAgain.body.reason, 'already_replayed')
+    assert.equal(createCalls, 1)
+
+    const listAfter = await request(app)
+      .get('/admin/audit-logs/dead-letters')
+      .set('Authorization', `Bearer ${token}`)
+    assert.equal(listAfter.status, 200)
+    assert.equal(listAfter.body.items[0].replayState, 'REPLAYED')
+    assert.equal(typeof listAfter.body.items[0].lastAttemptAt, 'string')
+  } finally {
+    if (typeof previousPath === 'string') {
+      process.env.ADMIN_AUDIT_DEAD_LETTER_PATH = previousPath
+    } else {
+      delete process.env.ADMIN_AUDIT_DEAD_LETTER_PATH
+    }
+    if (typeof previousStatusPath === 'string') {
+      process.env.ADMIN_AUDIT_DEAD_LETTER_STATUS_PATH = previousStatusPath
+    } else {
+      delete process.env.ADMIN_AUDIT_DEAD_LETTER_STATUS_PATH
+    }
+    await rm(tempPath, { force: true }).catch(() => {})
+    await rm(tempStatusPath, { force: true }).catch(() => {})
+  }
 })
 
 test('POST /admin/safety/delivery-logs/:id/retry retries dead-letter log', async () => {

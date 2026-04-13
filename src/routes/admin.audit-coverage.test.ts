@@ -57,6 +57,7 @@ const auditedRouteKeys = new Set<string>([
 ])
 
 const exemptRouteKeys = new Set<string>([])
+exemptRouteKeys.add('POST /audit-logs/dead-letters/:id/replay')
 
 test('admin mutating routes are explicitly classified as audited or exempt', () => {
   const known = new Set([...auditedRouteKeys, ...exemptRouteKeys])

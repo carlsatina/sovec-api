@@ -2,7 +2,8 @@ import { Router } from 'express'
 import { z } from 'zod'
 import prisma from '../db.js'
 import { Prisma } from '@prisma/client'
-import { appendFile } from 'node:fs/promises'
+import { appendFile, readFile, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { getAuthContext, requireAdmin } from '../lib/auth.js'
 import { ADMIN_TARGET_STATUSES, appendAdminStatusNote, canTransitionApplicationStatus } from '../lib/admin-driver-applications.js'
 import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment.js'
@@ -28,7 +29,14 @@ const SAFETY_TIMELINE_EVENT_TYPES = ['SOS_TRIGGERED', 'ADMIN_SAFETY_ACKNOWLEDGED
 const SAFETY_DELIVERY_STATUSES = ['DELIVERED', 'DEAD_LETTER'] as const
 const SAFETY_DELIVERY_CHANNELS = ['sms', 'email', 'webhook'] as const
 const ADMIN_AUDIT_MAX_RETRIES = Number(process.env.ADMIN_AUDIT_MAX_RETRIES ?? 2)
-const ADMIN_AUDIT_DEAD_LETTER_PATH = process.env.ADMIN_AUDIT_DEAD_LETTER_PATH ?? '/tmp/eride-admin-audit-dead-letter.ndjson'
+
+function getAdminAuditDeadLetterPath() {
+  return process.env.ADMIN_AUDIT_DEAD_LETTER_PATH ?? '/tmp/eride-admin-audit-dead-letter.ndjson'
+}
+
+function getAdminAuditDeadLetterStatusPath() {
+  return process.env.ADMIN_AUDIT_DEAD_LETTER_STATUS_PATH ?? `${getAdminAuditDeadLetterPath()}.status.json`
+}
 
 function parseBooleanQuery(value: unknown) {
   if (typeof value === 'boolean') return value
@@ -203,20 +211,22 @@ async function recordAdminAudit(input: {
   }
 
   try {
-    await appendFile(ADMIN_AUDIT_DEAD_LETTER_PATH, `${JSON.stringify(deadLetter)}\n`, 'utf8')
+    const deadLetterPath = getAdminAuditDeadLetterPath()
+    await appendFile(deadLetterPath, `${JSON.stringify(deadLetter)}\n`, 'utf8')
     console.error('[admin-audit] persisted to dead-letter', {
       action: input.action,
       targetType: input.targetType,
       targetId: input.targetId ?? null,
-      path: ADMIN_AUDIT_DEAD_LETTER_PATH,
+      path: deadLetterPath,
       error: errorMessage
     })
   } catch (deadLetterErr) {
+    const deadLetterPath = getAdminAuditDeadLetterPath()
     console.error('[admin-audit] failed to persist and dead-letter', {
       action: input.action,
       targetType: input.targetType,
       targetId: input.targetId ?? null,
-      path: ADMIN_AUDIT_DEAD_LETTER_PATH,
+      path: deadLetterPath,
       error: errorMessage,
       deadLetterError: deadLetterErr instanceof Error ? deadLetterErr.message : String(deadLetterErr)
     })
@@ -261,6 +271,64 @@ async function recordAdminAuditInTx(
   const repo = (tx as any).adminAuditLog
   if (!repo?.create) return
   await repo.create({ data: buildAdminAuditPayload(input) })
+}
+
+function parseAdminAuditDeadLetterLine(line: string) {
+  const parsed = JSON.parse(line) as {
+    capturedAt?: string
+    payload?: {
+      adminId?: string
+      action?: string
+      targetType?: string
+      targetId?: string | null
+      summary?: string | null
+      before?: unknown
+      after?: unknown
+      metadata?: unknown
+    }
+    error?: string
+  }
+  const payload = parsed.payload ?? {}
+  return {
+    capturedAt: parsed.capturedAt ?? '',
+    adminId: payload.adminId ?? '',
+    action: payload.action ?? '',
+    targetType: payload.targetType ?? '',
+    targetId: payload.targetId ?? null,
+    summary: payload.summary ?? null,
+    before: payload.before ?? null,
+    after: payload.after ?? null,
+    metadata: payload.metadata ?? null,
+    error: parsed.error ?? 'Unknown error'
+  }
+}
+
+function toAdminAuditDeadLetterId(line: string) {
+  return createHash('sha1').update(line).digest('hex')
+}
+
+type DeadLetterReplayState = {
+  replayState?: 'REPLAYED' | 'FAILED'
+  lastAttemptAt?: string
+  lastError?: string | null
+}
+
+async function readAdminAuditDeadLetterReplayState() {
+  const path = getAdminAuditDeadLetterStatusPath()
+  try {
+    const raw = await readFile(path, 'utf8')
+    const parsed = JSON.parse(raw) as Record<string, DeadLetterReplayState>
+    return parsed ?? {}
+  } catch (err) {
+    const code = (err as { code?: string } | undefined)?.code
+    if (code === 'ENOENT') return {}
+    throw err
+  }
+}
+
+async function writeAdminAuditDeadLetterReplayState(value: Record<string, DeadLetterReplayState>) {
+  const path = getAdminAuditDeadLetterStatusPath()
+  await writeFile(path, JSON.stringify(value, null, 2), 'utf8')
 }
 
 async function enrichSafetyIncidents(items: Array<{
@@ -1114,6 +1182,164 @@ router.post('/support/tickets/:id/status', async (req, res) => {
   })
 
   return res.json({ ok: true, ticket: updated })
+})
+
+router.get('/audit-logs/dead-letters', async (req, res) => {
+  const parsed = z.object({
+    q: z.string().trim().min(1).max(160).optional(),
+    action: z.string().trim().min(1).max(120).optional(),
+    targetType: z.string().trim().min(1).max(120).optional(),
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20)
+  }).safeParse(req.query)
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
+
+  const path = getAdminAuditDeadLetterPath()
+  let fileText = ''
+  try {
+    fileText = await readFile(path, 'utf8')
+  } catch (err) {
+    const code = (err as { code?: string } | undefined)?.code
+    if (code === 'ENOENT') {
+      return res.json({
+        path,
+        items: [],
+        page: parsed.data.page,
+        limit: parsed.data.limit,
+        total: 0,
+        totalPages: 1
+      })
+    }
+    throw err
+  }
+
+  const lines = fileText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const replayState = await readAdminAuditDeadLetterReplayState()
+
+  const allItems = lines
+    .reverse()
+    .map((line) => {
+      try {
+        const id = toAdminAuditDeadLetterId(line)
+        return {
+          id,
+          ...parseAdminAuditDeadLetterLine(line),
+          replayState: replayState[id]?.replayState ?? null,
+          lastAttemptAt: replayState[id]?.lastAttemptAt ?? null,
+          lastError: replayState[id]?.lastError ?? null
+        }
+      } catch {
+        return null
+      }
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+
+  const q = parsed.data.q?.toLowerCase()
+  const filtered = allItems.filter((item) => {
+    if (parsed.data.action && item.action !== parsed.data.action) return false
+    if (parsed.data.targetType && item.targetType !== parsed.data.targetType) return false
+    if (q) {
+      const haystack = [
+        item.adminId,
+        item.action,
+        item.targetType,
+        item.targetId ?? '',
+        item.summary ?? '',
+        item.error,
+        JSON.stringify(item.metadata ?? null)
+      ].join(' ').toLowerCase()
+      if (!haystack.includes(q)) return false
+    }
+    return true
+  })
+
+  const total = filtered.length
+  const skip = (parsed.data.page - 1) * parsed.data.limit
+  const items = filtered.slice(skip, skip + parsed.data.limit)
+
+  return res.json({
+    path,
+    items,
+    page: parsed.data.page,
+    limit: parsed.data.limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / parsed.data.limit))
+  })
+})
+
+router.post('/audit-logs/dead-letters/:id/replay', async (req, res) => {
+  const id = String(req.params.id ?? '').trim()
+  if (!id) return res.status(422).json({ error: 'Dead-letter id is required' })
+
+  const path = getAdminAuditDeadLetterPath()
+  let fileText = ''
+  try {
+    fileText = await readFile(path, 'utf8')
+  } catch (err) {
+    const code = (err as { code?: string } | undefined)?.code
+    if (code === 'ENOENT') return res.status(404).json({ error: 'Dead-letter file not found' })
+    throw err
+  }
+
+  const lines = fileText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const matched = lines.find((line) => {
+    try {
+      return toAdminAuditDeadLetterId(line) === id
+    } catch {
+      return false
+    }
+  })
+  if (!matched) return res.status(404).json({ error: 'Dead-letter entry not found' })
+
+  const replayState = await readAdminAuditDeadLetterReplayState()
+  const existingState = replayState[id]
+  if (existingState?.replayState === 'REPLAYED') {
+    return res.json({ ok: true, replayed: false, reason: 'already_replayed' })
+  }
+
+  const parsed = parseAdminAuditDeadLetterLine(matched)
+  const now = new Date().toISOString()
+
+  try {
+    await (prisma as any).adminAuditLog.create({
+      data: {
+        adminId: parsed.adminId,
+        action: parsed.action,
+        targetType: parsed.targetType,
+        targetId: parsed.targetId ?? null,
+        summary: parsed.summary ?? null,
+        before: parsed.before ?? null,
+        after: parsed.after ?? null,
+        metadata: parsed.metadata ?? null
+      }
+    })
+    replayState[id] = {
+      replayState: 'REPLAYED',
+      lastAttemptAt: now,
+      lastError: null
+    }
+    await writeAdminAuditDeadLetterReplayState(replayState)
+    return res.json({ ok: true, replayed: true })
+  } catch (err) {
+    replayState[id] = {
+      replayState: 'FAILED',
+      lastAttemptAt: now,
+      lastError: err instanceof Error ? err.message : String(err)
+    }
+    await writeAdminAuditDeadLetterReplayState(replayState).catch(() => null)
+    return res.status(500).json({
+      error: 'Failed to replay dead-letter audit entry',
+      detail: replayState[id].lastError
+    })
+  }
 })
 
 router.get('/audit-logs', async (req, res) => {
