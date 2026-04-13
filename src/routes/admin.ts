@@ -19,6 +19,7 @@ const FLEET_HISTORY_ACTIONS = ['FLEET_CREATE_VEHICLE', 'FLEET_ASSIGN_DRIVER', 'F
 const PAYMENT_STATUSES = ['PENDING', 'PAID', 'VERIFIED', 'FAILED', 'REFUND_PENDING', 'REFUNDED'] as const
 const PAYMENT_METHODS = ['CASH', 'EWALLET', 'CARD'] as const
 const SUPPORT_TICKET_STATUSES = ['OPEN', 'IN_REVIEW', 'RESOLVED', 'CLOSED'] as const
+const OPEN_SUPPORT_TICKET_STATUSES = ['OPEN', 'IN_REVIEW'] as const
 const REVENUE_PAYMENT_STATUSES = ['PAID', 'VERIFIED'] as const
 const SAFETY_INCIDENT_CATEGORIES = ['SOS', 'SAFETY'] as const
 const SAFETY_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const
@@ -53,6 +54,20 @@ function dayKey(date: Date) {
   const month = String(date.getMonth() + 1).padStart(2, '0')
   const day = String(date.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
+}
+
+function parseAuditDateParam(value: string, mode: 'start' | 'end') {
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value)
+  const normalized = isDateOnly ? `${value}${mode === 'start' ? 'T00:00:00.000Z' : 'T23:59:59.999Z'}` : value
+  const date = new Date(normalized)
+  if (Number.isNaN(date.getTime())) return null
+  return date
+}
+
+function toCsvCell(value: unknown) {
+  const text = typeof value === 'string' ? value : value == null ? '' : String(value)
+  const safeText = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text
+  return `"${safeText.replaceAll('"', '""')}"`
 }
 
 function isAllowedVehicleStatusTransition(current: (typeof VEHICLE_STATUSES)[number], next: (typeof VEHICLE_STATUSES)[number]) {
@@ -1042,20 +1057,12 @@ router.get('/audit-logs', async (req, res) => {
   }).safeParse(req.query)
   if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
 
-  const parseDateParam = (value: string, mode: 'start' | 'end') => {
-    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value)
-    const normalized = isDateOnly ? `${value}${mode === 'start' ? 'T00:00:00.000Z' : 'T23:59:59.999Z'}` : value
-    const date = new Date(normalized)
-    if (Number.isNaN(date.getTime())) return null
-    return date
-  }
-
-  const fromDate = parsed.data.from ? parseDateParam(parsed.data.from, 'start') : null
+  const fromDate = parsed.data.from ? parseAuditDateParam(parsed.data.from, 'start') : null
   if (parsed.data.from && !fromDate) {
     return res.status(422).json({ error: 'Invalid from date. Use ISO datetime or YYYY-MM-DD.' })
   }
 
-  const toDate = parsed.data.to ? parseDateParam(parsed.data.to, 'end') : null
+  const toDate = parsed.data.to ? parseAuditDateParam(parsed.data.to, 'end') : null
   if (parsed.data.to && !toDate) {
     return res.status(422).json({ error: 'Invalid to date. Use ISO datetime or YYYY-MM-DD.' })
   }
@@ -1114,6 +1121,96 @@ router.get('/audit-logs', async (req, res) => {
     total,
     totalPages: Math.max(1, Math.ceil(total / parsed.data.limit))
   })
+})
+
+router.get('/audit-logs/export.csv', async (req, res) => {
+  const parsed = z.object({
+    actorId: z.string().trim().min(1).optional(),
+    action: z.string().trim().min(1).max(120).optional(),
+    targetType: z.string().trim().min(1).max(120).optional(),
+    q: z.string().trim().min(1).max(120).optional(),
+    from: z.string().trim().min(1).optional(),
+    to: z.string().trim().min(1).optional(),
+    limit: z.coerce.number().int().min(1).max(10000).default(5000)
+  }).safeParse(req.query)
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
+
+  const fromDate = parsed.data.from ? parseAuditDateParam(parsed.data.from, 'start') : null
+  if (parsed.data.from && !fromDate) {
+    return res.status(422).json({ error: 'Invalid from date. Use ISO datetime or YYYY-MM-DD.' })
+  }
+
+  const toDate = parsed.data.to ? parseAuditDateParam(parsed.data.to, 'end') : null
+  if (parsed.data.to && !toDate) {
+    return res.status(422).json({ error: 'Invalid to date. Use ISO datetime or YYYY-MM-DD.' })
+  }
+
+  if (fromDate && toDate && fromDate.getTime() > toDate.getTime()) {
+    return res.status(422).json({ error: 'Invalid date range: from must be before to.' })
+  }
+
+  const createdAtWhere = {
+    ...(fromDate ? { gte: fromDate } : {}),
+    ...(toDate ? { lte: toDate } : {})
+  }
+
+  const where = {
+    ...(parsed.data.actorId ? { adminId: parsed.data.actorId } : {}),
+    ...(parsed.data.action ? { action: parsed.data.action } : {}),
+    ...(parsed.data.targetType ? { targetType: parsed.data.targetType } : {}),
+    ...(Object.keys(createdAtWhere).length > 0 ? { createdAt: createdAtWhere } : {}),
+    ...(parsed.data.q
+      ? {
+        OR: [
+          { id: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { targetId: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { summary: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { action: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { targetType: { contains: parsed.data.q, mode: 'insensitive' as const } },
+          { admin: { name: { contains: parsed.data.q, mode: 'insensitive' as const } } },
+          { admin: { phone: { contains: parsed.data.q, mode: 'insensitive' as const } } }
+        ]
+      }
+      : {})
+  }
+
+  const auditRepo = (prisma as any).adminAuditLog
+  if (!auditRepo?.findMany) {
+    return res.status(501).json({ error: 'Admin audit log store is not available' })
+  }
+
+  const items = await auditRepo.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: parsed.data.limit,
+    include: {
+      admin: { select: { id: true, name: true, phone: true, email: true, role: true } }
+    }
+  })
+
+  const headers: string[] = ['id', 'createdAt', 'adminId', 'adminName', 'adminPhone', 'action', 'targetType', 'targetId', 'summary', 'before', 'after', 'metadata']
+  const csvRows: unknown[][] = items.map((item: any) => [
+    item.id,
+    item.createdAt instanceof Date ? item.createdAt.toISOString() : String(item.createdAt ?? ''),
+    item.adminId,
+    item.admin?.name ?? '',
+    item.admin?.phone ?? '',
+    item.action,
+    item.targetType,
+    item.targetId ?? '',
+    item.summary ?? '',
+    JSON.stringify(item.before ?? null),
+    JSON.stringify(item.after ?? null),
+    JSON.stringify(item.metadata ?? null)
+  ])
+  const csv = [headers, ...csvRows]
+    .map((row) => row.map((cell: unknown) => toCsvCell(cell)).join(','))
+    .join('\n')
+
+  const timestamp = new Date().toISOString().replaceAll(':', '-')
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="admin-audit-logs-${timestamp}.csv"`)
+  return res.status(200).send(csv)
 })
 
 router.get('/safety/templates', async (_req, res) => {
@@ -1355,6 +1452,65 @@ router.get('/safety/incidents', async (req, res) => {
     limit: parsed.data.limit,
     total: nextTotal,
     totalPages: Math.max(1, Math.ceil(nextTotal / parsed.data.limit))
+  })
+})
+
+router.get('/safety/metrics', async (req, res) => {
+  const parsed = z.object({
+    days: z.coerce.number().int().min(1).max(90).default(7)
+  }).safeParse(req.query)
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
+
+  const now = new Date()
+  const start = addDays(startOfDay(now), -(parsed.data.days - 1))
+  const end = addDays(startOfDay(now), 1)
+
+  const incidents = await prisma.supportTicket.findMany({
+    where: {
+      category: { in: [...SAFETY_INCIDENT_CATEGORIES] },
+      createdAt: { gte: start, lt: end }
+    },
+    include: {
+      user: { select: { id: true, name: true, phone: true, email: true, role: true } }
+    }
+  })
+
+  const enriched = await enrichSafetyIncidents(incidents)
+  const openItems = enriched.filter((item) => OPEN_SUPPORT_TICKET_STATUSES.includes(item.status as (typeof OPEN_SUPPORT_TICKET_STATUSES)[number]))
+  const ackSamples = enriched.map((item) => item.sla.ackSeconds).filter((value): value is number => typeof value === 'number')
+  const resolveSamples = enriched.map((item) => item.sla.resolveSeconds).filter((value): value is number => typeof value === 'number')
+
+  const avgAckSeconds = ackSamples.length > 0 ? Math.round(ackSamples.reduce((sum, value) => sum + value, 0) / ackSamples.length) : null
+  const avgResolveSeconds = resolveSamples.length > 0 ? Math.round(resolveSamples.reduce((sum, value) => sum + value, 0) / resolveSamples.length) : null
+
+  const byPriority = SAFETY_PRIORITIES.map((priority) => {
+    const items = enriched.filter((item) => (item.incidentMeta?.priority ?? 'HIGH') === priority)
+    const open = items.filter((item) => OPEN_SUPPORT_TICKET_STATUSES.includes(item.status as (typeof OPEN_SUPPORT_TICKET_STATUSES)[number]))
+    const overdue = open.filter((item) => item.sla.overdue)
+    const ack = items.map((item) => item.sla.ackSeconds).filter((value): value is number => typeof value === 'number')
+    const resolve = items.map((item) => item.sla.resolveSeconds).filter((value): value is number => typeof value === 'number')
+
+    return {
+      priority,
+      total: items.length,
+      open: open.length,
+      overdue: overdue.length,
+      avgAckSeconds: ack.length > 0 ? Math.round(ack.reduce((sum, value) => sum + value, 0) / ack.length) : null,
+      avgResolveSeconds: resolve.length > 0 ? Math.round(resolve.reduce((sum, value) => sum + value, 0) / resolve.length) : null
+    }
+  })
+
+  return res.json({
+    days: parsed.data.days,
+    windowStart: start.toISOString(),
+    windowEnd: end.toISOString(),
+    totalIncidents: enriched.length,
+    openIncidents: openItems.length,
+    criticalOpenIncidents: openItems.filter((item) => (item.incidentMeta?.priority ?? 'HIGH') === 'CRITICAL').length,
+    overdueOpenIncidents: openItems.filter((item) => item.sla.overdue).length,
+    avgAckSeconds,
+    avgResolveSeconds,
+    byPriority
   })
 })
 
@@ -2027,7 +2183,9 @@ router.post('/vehicles', async (req, res) => {
 
 router.post('/vehicles/:id/assign-driver', async (req, res) => {
   const parsed = z.object({
-    driverId: z.string().trim().min(1).nullable().optional()
+    driverId: z.string().trim().min(1).nullable().optional(),
+    force: z.boolean().optional(),
+    reason: z.string().trim().min(3).max(200).optional()
   }).safeParse(req.body)
   if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() })
 
@@ -2038,13 +2196,24 @@ router.post('/vehicles/:id/assign-driver', async (req, res) => {
   if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' })
 
   const nextDriverId = parsed.data.driverId ?? null
+  const force = Boolean(parsed.data.force)
   if (nextDriverId) {
     const driver = await prisma.user.findUnique({
       where: { id: nextDriverId },
-      select: { id: true, role: true }
+      select: { id: true, role: true, driverLocation: { select: { isAvailable: true } } }
     })
     if (!driver) return res.status(404).json({ error: 'Driver not found' })
     if (driver.role !== 'DRIVER') return res.status(422).json({ error: 'Assigned user must have DRIVER role' })
+    if (driver.driverLocation?.isAvailable === false && !force) {
+      return res.status(409).json({
+        error: 'Driver is currently offline/unavailable. Set force=true with reason to override.'
+      })
+    }
+    if (driver.driverLocation?.isAvailable === false && force && !parsed.data.reason) {
+      return res.status(422).json({
+        error: 'Reason is required when forcing assignment for an offline/unavailable driver'
+      })
+    }
 
     const assignedVehicle = await prisma.vehicle.findFirst({
       where: { driverId: nextDriverId, id: { not: vehicle.id } },
@@ -2069,7 +2238,11 @@ router.post('/vehicles/:id/assign-driver', async (req, res) => {
     targetId: vehicle.id,
     summary: `Vehicle ${vehicle.id.slice(0, 8)} driver assignment updated`,
     before: { driverId: vehicle.driverId ?? null },
-    after: { driverId: nextDriverId }
+    after: { driverId: nextDriverId },
+    metadata: {
+      forceAssignment: force,
+      forceReason: parsed.data.reason ?? null
+    }
   })
 
   return res.json({ ok: true, vehicle: updated })

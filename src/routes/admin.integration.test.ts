@@ -96,6 +96,14 @@ test(
       })
       assert.equal(updatedPassenger?.role, 'DRIVER')
     } finally {
+      await (prisma as any).adminAuditLog?.deleteMany?.({
+        where: {
+          OR: [
+            { adminId: admin.id },
+            { targetId: application.id }
+          ]
+        }
+      }).catch(() => {})
       await prisma.driverApplication.deleteMany({ where: { id: application.id } })
       await prisma.user.deleteMany({ where: { id: { in: [admin.id, passenger.id] } } })
     }

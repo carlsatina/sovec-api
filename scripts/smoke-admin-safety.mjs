@@ -40,6 +40,38 @@ function assertOk(label, response) {
   }
 }
 
+function assertMetricsShape(metrics, label) {
+  const requiredNumberFields = [
+    'days',
+    'totalIncidents',
+    'openIncidents',
+    'criticalOpenIncidents',
+    'overdueOpenIncidents'
+  ]
+
+  for (const field of requiredNumberFields) {
+    if (typeof metrics?.[field] !== 'number') {
+      console.error(`[FAIL] ${label} invalid field "${field}"`)
+      console.error(metrics)
+      process.exit(1)
+    }
+  }
+
+  const isNullableNumber = (value) => value === null || typeof value === 'number'
+  if (!isNullableNumber(metrics?.avgAckSeconds) || !isNullableNumber(metrics?.avgResolveSeconds)) {
+    console.error(`[FAIL] ${label} invalid SLA averages`)
+    console.error(metrics)
+    process.exit(1)
+  }
+
+  const byPriority = Array.isArray(metrics?.byPriority) ? metrics.byPriority : null
+  if (!byPriority || byPriority.length !== 4) {
+    console.error(`[FAIL] ${label} invalid byPriority breakdown`)
+    console.error(metrics)
+    process.exit(1)
+  }
+}
+
 async function resolveIncidentId() {
   if (SMOKE_SAFETY_INCIDENT_ID) return SMOKE_SAFETY_INCIDENT_ID
 
@@ -65,6 +97,11 @@ async function run() {
   const logs = await requestJson('/admin/safety/delivery-logs?page=1&limit=5')
   assertOk('GET /admin/safety/delivery-logs', logs)
   console.log('[PASS] GET /admin/safety/delivery-logs')
+
+  const metricsBefore = await requestJson('/admin/safety/metrics?days=7')
+  assertOk('GET /admin/safety/metrics', metricsBefore)
+  assertMetricsShape(metricsBefore.json, 'GET /admin/safety/metrics')
+  console.log('[PASS] GET /admin/safety/metrics (shape validated)')
 
   const updateTemplate = await requestJson('/admin/safety/templates/ESCALATION_ADMIN', {
     method: 'PUT',
@@ -133,6 +170,11 @@ async function run() {
     process.exit(1)
   }
   console.log('[PASS] GET /admin/safety/incidents resolved (updated incident found)')
+
+  const metricsAfter = await requestJson('/admin/safety/metrics?days=7')
+  assertOk('GET /admin/safety/metrics after lifecycle', metricsAfter)
+  assertMetricsShape(metricsAfter.json, 'GET /admin/safety/metrics after lifecycle')
+  console.log('[PASS] GET /admin/safety/metrics after lifecycle (shape validated)')
 
   const deadLetters = await requestJson(`/admin/safety/delivery-logs?incidentId=${encodeURIComponent(incidentId)}&status=DEAD_LETTER&page=1&limit=5`)
   assertOk('GET /admin/safety/delivery-logs dead letters', deadLetters)

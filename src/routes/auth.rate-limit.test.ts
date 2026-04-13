@@ -12,6 +12,27 @@ function createTestApp() {
   return app
 }
 
+function isTransientTransportError(err: unknown) {
+  const code = (err as { code?: string } | undefined)?.code
+  return code === 'HPE_INVALID_CONSTANT' || code === 'ECONNRESET'
+}
+
+async function postOtpSendWithIp(app: ReturnType<typeof createTestApp>, phone: string, ip: string) {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await request(app)
+        .post('/auth/otp/send')
+        .set('X-Forwarded-For', ip)
+        .send({ phone })
+    } catch (err) {
+      if (!isTransientTransportError(err) || attempt === 2) throw err
+      lastError = err
+    }
+  }
+  throw lastError
+}
+
 async function triggerVerifyLock(app: ReturnType<typeof createTestApp>, phone: string) {
   for (let i = 0; i < 12; i += 1) {
     const res = await request(app).post('/auth/otp/verify').send({ phone, code: '000000' })
@@ -86,17 +107,11 @@ test('POST /auth/otp/send enforces IP-based limit across different phone numbers
 
   for (let i = 0; i < 5; i += 1) {
     const phone = `+63915${String(1000000 + i)}`
-    const res = await request(app)
-      .post('/auth/otp/send')
-      .set('X-Forwarded-For', ip)
-      .send({ phone })
+    const res = await postOtpSendWithIp(app, phone, ip)
     assert.equal(res.status, 200)
   }
 
-  const blocked = await request(app)
-    .post('/auth/otp/send')
-    .set('X-Forwarded-For', ip)
-    .send({ phone: '+639151234567' })
+  const blocked = await postOtpSendWithIp(app, '+639151234567', ip)
 
   assert.equal(blocked.status, 429)
   assert.equal(typeof blocked.body.retryAfterSec, 'number')

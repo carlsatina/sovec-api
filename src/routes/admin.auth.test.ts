@@ -208,6 +208,27 @@ test('GET /admin/safety/incidents requires ADMIN role', async () => {
   assert.equal(res.status, 403)
 })
 
+test('GET /admin/safety/metrics requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).get('/admin/safety/metrics')
+  assert.equal(res.status, 401)
+})
+
+test('GET /admin/safety/metrics requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .get('/admin/safety/metrics')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
+})
+
 test('GET /admin/safety/templates requires auth token', async () => {
   const app = createTestApp()
   const res = await request(app).get('/admin/safety/templates')
@@ -241,6 +262,12 @@ test('GET /admin/audit-logs requires auth token', async () => {
   assert.equal(res.status, 401)
 })
 
+test('GET /admin/audit-logs/export.csv requires auth token', async () => {
+  const app = createTestApp()
+  const res = await request(app).get('/admin/audit-logs/export.csv')
+  assert.equal(res.status, 401)
+})
+
 test('GET /admin/audit-logs requires ADMIN role', async () => {
   const app = createTestApp()
   const token = signAuthToken({
@@ -251,6 +278,21 @@ test('GET /admin/audit-logs requires ADMIN role', async () => {
 
   const res = await request(app)
     .get('/admin/audit-logs')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 403)
+})
+
+test('GET /admin/audit-logs/export.csv requires ADMIN role', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'user-passenger',
+    phone: '+639171111111',
+    role: 'PASSENGER'
+  })
+
+  const res = await request(app)
+    .get('/admin/audit-logs/export.csv')
     .set('Authorization', `Bearer ${token}`)
 
   assert.equal(res.status, 403)
@@ -504,7 +546,7 @@ test('POST /admin/vehicles/:id/assign-driver returns conflict when driver alread
     findFirst: async () => ({ id: 'vehicle-2' })
   }
   ;(prisma as any).user = {
-    findUnique: async () => ({ id: 'driver-1', role: 'DRIVER' })
+    findUnique: async () => ({ id: 'driver-1', role: 'DRIVER', driverLocation: { isAvailable: true } })
   }
 
   const res = await request(app)
@@ -514,6 +556,95 @@ test('POST /admin/vehicles/:id/assign-driver returns conflict when driver alread
 
   assert.equal(res.status, 409)
   assert.match(res.body.error, /already has an assigned vehicle/i)
+})
+
+test('POST /admin/vehicles/:id/assign-driver blocks offline driver unless forced', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1', driverId: null })
+  }
+  ;(prisma as any).user = {
+    findUnique: async () => ({ id: 'driver-1', role: 'DRIVER', driverLocation: { isAvailable: false } })
+  }
+
+  const res = await request(app)
+    .post('/admin/vehicles/vehicle-1/assign-driver')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ driverId: 'driver-1' })
+
+  assert.equal(res.status, 409)
+  assert.match(res.body.error, /offline\/unavailable/i)
+})
+
+test('POST /admin/vehicles/:id/assign-driver requires reason when forcing offline driver assignment', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1', driverId: null })
+  }
+  ;(prisma as any).user = {
+    findUnique: async () => ({ id: 'driver-1', role: 'DRIVER', driverLocation: { isAvailable: false } })
+  }
+
+  const res = await request(app)
+    .post('/admin/vehicles/vehicle-1/assign-driver')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ driverId: 'driver-1', force: true })
+
+  assert.equal(res.status, 422)
+  assert.match(res.body.error, /Reason is required/i)
+})
+
+test('POST /admin/vehicles/:id/assign-driver allows forced offline assignment with reason', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  ;(prisma as any).vehicle = {
+    findUnique: async () => ({ id: 'vehicle-1', driverId: null }),
+    findFirst: async () => null,
+    update: async () => ({
+      id: 'vehicle-1',
+      driverId: 'driver-1',
+      driver: { id: 'driver-1', name: 'Driver One', phone: '+639171234567', email: null, role: 'DRIVER' }
+    })
+  }
+  ;(prisma as any).user = {
+    findUnique: async () => ({ id: 'driver-1', role: 'DRIVER', driverLocation: { isAvailable: false } })
+  }
+
+  let capturedAuditMetadata: unknown = null
+  ;(prisma as any).adminAuditLog = {
+    create: async (args: any) => {
+      capturedAuditMetadata = args.data.metadata
+      return { id: 'audit-1' }
+    }
+  }
+
+  const res = await request(app)
+    .post('/admin/vehicles/vehicle-1/assign-driver')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ driverId: 'driver-1', force: true, reason: 'Emergency redistribution' })
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(capturedAuditMetadata, {
+    forceAssignment: true,
+    forceReason: 'Emergency redistribution'
+  })
 })
 
 test('POST /admin/vehicles/:id/status returns 404 when vehicle is missing', async () => {
@@ -927,8 +1058,9 @@ test('GET /admin/analytics/trends returns bucketed trend data', async () => {
     role: 'ADMIN'
   })
 
-  const now = new Date('2026-04-10T12:00:00.000Z')
-  const yesterday = new Date('2026-04-09T12:00:00.000Z')
+  const now = new Date()
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
 
   ;(prisma as any).ride = {
     findMany: async () => [
@@ -939,8 +1071,8 @@ test('GET /admin/analytics/trends returns bucketed trend data', async () => {
   }
   ;(prisma as any).payment = {
     findMany: async () => [
-      { createdAt: now, amount: 200 },
-      { createdAt: yesterday, amount: 150 }
+      { createdAt: now, amount: 200, status: 'PAID' },
+      { createdAt: yesterday, amount: 150, status: 'VERIFIED' }
     ]
   }
 
@@ -1064,6 +1196,65 @@ test('GET /admin/safety/incidents post-filters paginate correctly beyond 500 rec
   assert.equal(res.body.items.length, 20)
 })
 
+test('GET /admin/safety/metrics returns aggregate SLA metrics', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const now = new Date()
+  const tenMinutesAgo = new Date(now.getTime() - (10 * 60 * 1000))
+  const oneHourAgo = new Date(now.getTime() - (60 * 60 * 1000))
+  const twoHoursAgo = new Date(now.getTime() - (2 * 60 * 60 * 1000))
+
+  ;(prisma as any).supportTicket = {
+    findMany: async () => [
+      {
+        id: 'inc-1',
+        userId: 'user-1',
+        category: 'SOS',
+        description: `[META]${JSON.stringify({ priority: 'CRITICAL', acknowledgedAt: tenMinutesAgo.toISOString(), resolvedAt: null })}\nIncident 1`,
+        status: 'OPEN',
+        createdAt: oneHourAgo,
+        user: { id: 'user-1', name: 'User One', phone: '+639170000010', email: null, role: 'PASSENGER' }
+      },
+      {
+        id: 'inc-2',
+        userId: 'user-2',
+        category: 'SAFETY',
+        description: `[META]${JSON.stringify({ priority: 'HIGH', acknowledgedAt: oneHourAgo.toISOString(), resolvedAt: now.toISOString() })}\nIncident 2`,
+        status: 'RESOLVED',
+        createdAt: twoHoursAgo,
+        user: { id: 'user-2', name: 'User Two', phone: '+639170000011', email: null, role: 'PASSENGER' }
+      }
+    ]
+  }
+  ;(prisma as any).rideEvent = {
+    findMany: async () => []
+  }
+
+  const res = await request(app)
+    .get('/admin/safety/metrics?days=7')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.days, 7)
+  assert.equal(res.body.totalIncidents, 2)
+  assert.equal(res.body.openIncidents, 1)
+  assert.equal(res.body.criticalOpenIncidents, 1)
+  assert.equal(typeof res.body.overdueOpenIncidents, 'number')
+  assert.equal(typeof res.body.avgAckSeconds === 'number' || res.body.avgAckSeconds === null, true)
+  assert.equal(typeof res.body.avgResolveSeconds === 'number' || res.body.avgResolveSeconds === null, true)
+  assert.equal(Array.isArray(res.body.byPriority), true)
+  assert.equal(res.body.byPriority.length, 4)
+
+  const critical = res.body.byPriority.find((row: any) => row.priority === 'CRITICAL')
+  assert.equal(critical.total, 1)
+  assert.equal(critical.open, 1)
+})
+
 test('GET /admin/safety/delivery-logs applies filters and pagination', async () => {
   const app = createTestApp()
   const token = signAuthToken({
@@ -1156,6 +1347,58 @@ test('GET /admin/audit-logs rejects invalid date range', async () => {
 
   assert.equal(res.status, 422)
   assert.equal(res.body.error, 'Invalid date range: from must be before to.')
+})
+
+test('GET /admin/audit-logs/export.csv returns csv rows for filtered logs', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  let capturedWhere: unknown = null
+  ;(prisma as any).adminAuditLog = {
+    findMany: async (args: any) => {
+      capturedWhere = args.where
+      return [
+        {
+          id: 'log-1',
+          createdAt: new Date('2026-04-12T10:00:00.000Z'),
+          adminId: 'admin-1',
+          action: 'PAYMENT_VERIFY',
+          targetType: 'PAYMENT',
+          targetId: 'pay-1',
+          summary: '=cmd|\' /C calc\'!A0',
+          before: { status: 'PAID' },
+          after: { status: 'VERIFIED' },
+          metadata: { note: 'ok' },
+          admin: {
+            id: 'admin-1',
+            name: 'Admin One',
+            phone: '+639170000001'
+          }
+        }
+      ]
+    }
+  }
+
+  const res = await request(app)
+    .get('/admin/audit-logs/export.csv?action=PAYMENT_VERIFY&from=2026-04-10&to=2026-04-13')
+    .set('Authorization', `Bearer ${token}`)
+
+  assert.equal(res.status, 200)
+  assert.equal(String(res.headers['content-type']).includes('text/csv'), true)
+  assert.equal(String(res.headers['content-disposition']).includes('attachment; filename='), true)
+  const where = capturedWhere as any
+  assert.equal(where.action, 'PAYMENT_VERIFY')
+  assert.equal(where.createdAt.gte.toISOString(), '2026-04-10T00:00:00.000Z')
+  assert.equal(where.createdAt.lte.toISOString(), '2026-04-13T23:59:59.999Z')
+  assert.equal(typeof res.text, 'string')
+  assert.equal(res.text.includes('"id","createdAt","adminId","adminName","adminPhone","action","targetType","targetId","summary","before","after","metadata"'), true)
+  assert.equal(res.text.includes('"log-1"'), true)
+  assert.equal(res.text.includes('"PAYMENT_VERIFY"'), true)
+  assert.equal(res.text.includes('"\'=cmd|\' /C calc\'!A0"'), true)
 })
 
 test('POST /admin/safety/delivery-logs/:id/retry retries dead-letter log', async () => {

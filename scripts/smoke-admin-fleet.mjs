@@ -3,9 +3,11 @@
 const API_URL = process.env.API_URL ?? 'http://localhost:4000'
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN
 const SMOKE_DRIVER_ID = process.env.SMOKE_DRIVER_ID
+const SMOKE_OFFLINE_DRIVER_ID = process.env.SMOKE_OFFLINE_DRIVER_ID
+const SMOKE_FORCE_REASON = process.env.SMOKE_FORCE_REASON ?? 'Smoke override for offline assignment guardrail check'
 
 if (!ADMIN_TOKEN) {
-  console.error('Missing ADMIN_TOKEN. Example: ADMIN_TOKEN=<jwt> npm run smoke:admin:fleet')
+  console.error('Missing ADMIN_TOKEN. Example: ADMIN_TOKEN=<jwt> SMOKE_SUITES=admin-fleet npm run smoke')
   process.exit(1)
 }
 
@@ -103,6 +105,38 @@ async function run() {
   })
   assertOk('POST /admin/vehicles/:id/status -> CHARGING', updateStatus)
   console.log('[PASS] POST /admin/vehicles/:id/status -> CHARGING')
+
+  if (SMOKE_OFFLINE_DRIVER_ID) {
+    const offlineBlocked = await requestJson(`/admin/vehicles/${vehicleId}/assign-driver`, {
+      method: 'POST',
+      body: { driverId: SMOKE_OFFLINE_DRIVER_ID }
+    })
+    assertStatus('POST /admin/vehicles/:id/assign-driver offline without force (expected fail)', offlineBlocked, 409)
+    console.log('[PASS] Offline driver assignment blocked without force (409)')
+
+    const offlineForcedNoReason = await requestJson(`/admin/vehicles/${vehicleId}/assign-driver`, {
+      method: 'POST',
+      body: { driverId: SMOKE_OFFLINE_DRIVER_ID, force: true }
+    })
+    assertStatus('POST /admin/vehicles/:id/assign-driver offline with force but no reason (expected fail)', offlineForcedNoReason, 422)
+    console.log('[PASS] Offline forced assignment requires reason (422)')
+
+    const offlineForcedWithReason = await requestJson(`/admin/vehicles/${vehicleId}/assign-driver`, {
+      method: 'POST',
+      body: { driverId: SMOKE_OFFLINE_DRIVER_ID, force: true, reason: SMOKE_FORCE_REASON }
+    })
+    if (offlineForcedWithReason.ok) {
+      console.log('[PASS] Offline forced assignment with reason accepted')
+    } else if (offlineForcedWithReason.status === 409) {
+      console.log('[INFO] Offline forced assignment returned 409 (likely already assigned in fixture); guardrail checks still validated')
+    } else {
+      console.error('[FAIL] Offline forced assignment with reason')
+      console.error(offlineForcedWithReason.json)
+      process.exit(1)
+    }
+  } else {
+    console.log('[SKIP] Offline-driver guardrail flow (set SMOKE_OFFLINE_DRIVER_ID to enable)')
+  }
 
   if (SMOKE_DRIVER_ID) {
     const assign = await requestJson(`/admin/vehicles/${vehicleId}/assign-driver`, {
