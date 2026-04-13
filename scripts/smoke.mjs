@@ -12,6 +12,7 @@ const suitesRaw = process.env.SMOKE_SUITES?.trim()
 
 const allSuites = [
   { key: 'auth', label: 'Auth', file: 'smoke-auth.mjs', enabledByDefault: Boolean(process.env.SMOKE_PHONE) },
+  { key: 'payments', label: 'Payments', file: 'smoke-payments.mjs', enabledByDefault: false },
   { key: 'admin-bootstrap', label: 'Admin Bootstrap', file: 'smoke-admin-bootstrap.mjs', enabledByDefault: false },
   { key: 'admin-fleet', label: 'Admin Fleet', file: 'smoke-admin-fleet.mjs', enabledByDefault: Boolean(process.env.ADMIN_TOKEN) },
   { key: 'admin-support', label: 'Admin Support', file: 'smoke-admin-support.mjs', enabledByDefault: Boolean(process.env.ADMIN_TOKEN) },
@@ -25,14 +26,14 @@ const selectedKeys = suitesRaw
 
 if (selectedKeys.length === 0) {
   console.error('No smoke suites selected.')
-  console.error('Set SMOKE_PHONE and/or ADMIN_TOKEN, or use SMOKE_SUITES=auth,admin-bootstrap,admin-fleet,admin-support,admin-analytics,admin-safety')
+  console.error('Set SMOKE_PHONE and/or ADMIN_TOKEN, or use SMOKE_SUITES=auth,payments,admin-bootstrap,admin-fleet,admin-support,admin-analytics,admin-safety')
   process.exit(1)
 }
 
 const unknownKeys = selectedKeys.filter((key) => !allSuites.some((suite) => suite.key === key))
 if (unknownKeys.length > 0) {
   console.error(`Unknown suite(s): ${unknownKeys.join(', ')}`)
-  console.error('Valid suites: auth, admin-bootstrap, admin-fleet, admin-support, admin-analytics, admin-safety')
+  console.error('Valid suites: auth, payments, admin-bootstrap, admin-fleet, admin-support, admin-analytics, admin-safety')
   process.exit(1)
 }
 

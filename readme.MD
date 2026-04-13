@@ -41,6 +41,16 @@ cp .env.example .env
 - If using Resend:
   - `RESEND_API_KEY`
   - `RESEND_FROM_EMAIL` (must be a verified sender/domain in Resend)
+- Payment settings:
+  - `PAYMENT_PROVIDER` (`mock` or `paymongo`)
+  - `PAYMENT_WEBHOOK_SECRET` (used by `mock` webhook auth)
+  - If using PayMongo:
+    - `PAYMONGO_SECRET_KEY`
+    - `PAYMONGO_WEBHOOK_SECRET` (for webhook signature verification)
+    - `PAYMONGO_SUCCESS_URL`
+    - `PAYMONGO_CANCEL_URL`
+    - `PAYMONGO_API_BASE` (default `https://api.paymongo.com`)
+    - `PAYMONGO_CHECKOUT_API_VERSION` (default `v1`)
 - Safety escalation channels (optional):
   - `SAFETY_ESCALATION_PHONES` (comma-separated phone numbers for SMS alerts)
   - `SAFETY_ESCALATION_EMAILS` (comma-separated email recipients)
@@ -131,6 +141,26 @@ Health check endpoint:
 - Automated tests are available via `npm test`.
 - OTP SMS delivery uses `SMS_PROVIDER=mock` locally and should be set to `semaphore` in production.
 - Do not edit `dist/` directly; it is generated from `src/`.
+
+## Payments API (Phase 4 Foundation)
+- `GET /payments/methods`
+  - Returns supported methods (`CASH`, `EWALLET`, `CARD`)
+- `POST /payments/charge` (authenticated)
+  - Body: `{ rideId, method?, amount? }`
+  - Validates rider ownership of ride, upserts payment row, calls provider adapter, persists status/reference
+  - Provider behavior:
+    - `mock`:
+      - `CASH` -> immediate `PAID`
+      - `EWALLET` / `CARD` -> `PENDING` + mock `checkoutUrl`
+    - `paymongo`:
+      - `CASH` -> immediate `PAID` (manual/offline settlement path)
+      - `EWALLET` / `CARD` -> creates PayMongo Checkout Session, returns hosted `checkoutUrl`
+- `POST /payments/webhooks/:provider`
+  - Supported providers: `mock`, `paymongo`
+  - `mock` header (when `PAYMENT_WEBHOOK_SECRET` is configured): `x-payment-webhook-secret`
+  - `paymongo` header: `paymongo-signature` (validated when `PAYMONGO_WEBHOOK_SECRET` is configured)
+  - Body (mock): `{ eventId, reference, status }`
+  - Applies payment status transition and records a ride event (`PAYMENT_WEBHOOK_STATUS_CHANGED`)
 
 ## Admin APIs (Current)
 - `GET /admin/driver-applications`
@@ -299,12 +329,14 @@ SOS API:
   - `admin-bootstrap` is opt-in only (never auto-selected)
 - Explicit suite selection:
   - `SMOKE_SUITES=auth npm run smoke`
+  - `SMOKE_SUITES=payments SMOKE_PHONE=+639171111111 npm run smoke`
   - `SMOKE_SUITES=admin-bootstrap BOOTSTRAP_PHONE=+639171111111 ADMIN_BOOTSTRAP_SECRET=<secret> BOOTSTRAP_SECRET=<secret> npm run smoke`
   - `SMOKE_SUITES=admin-fleet,admin-support npm run smoke`
   - `SMOKE_SUITES=admin-analytics SMOKE_ANALYTICS_DAYS=30 npm run smoke`
   - `SMOKE_SUITES=admin-safety ADMIN_TOKEN=<admin-jwt> npm run smoke`
 - Suite-specific env vars:
   - Auth: `SMOKE_PHONE`, optional `SMOKE_OTP_CODE`
+  - Payments: `SMOKE_PHONE`, optional `SMOKE_OTP_CODE`, optional `PAYMENT_WEBHOOK_SECRET` (mock), `PAYMENT_PROVIDER` (mock/paymongo)
   - Admin bootstrap: `BOOTSTRAP_PHONE`, `ADMIN_BOOTSTRAP_SECRET`, `BOOTSTRAP_SECRET` (or `ALLOW_INSECURE_ADMIN_BOOTSTRAP=true`), optional `SMOKE_OTP_CODE`
   - Admin fleet: `ADMIN_TOKEN`, optional `SMOKE_DRIVER_ID` (enables assignment + `IN_USE` transition checks)
   - Admin support: `ADMIN_TOKEN`, optional `SMOKE_SUPPORT_TICKET_ID`, optional `SMOKE_SUPPORT_CATEGORY`

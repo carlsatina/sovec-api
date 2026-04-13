@@ -18,7 +18,11 @@ import adminRoutes from './routes/admin.js'
 const app = express()
 
 app.use(cors())
-app.use(express.json())
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    ;(req as any).rawBody = buf.toString('utf8')
+  }
+}))
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
