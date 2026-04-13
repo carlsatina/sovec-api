@@ -81,7 +81,7 @@ test('audited mutating routes call recordAdminAudit', () => {
 
     const end = i + 1 < routes.length ? routes[i + 1].start : adminRouteSource.length
     const routeBlock = adminRouteSource.slice(current.start, end)
-    const hasAuditCall = routeBlock.includes('recordAdminAudit(')
-    assert.equal(hasAuditCall, true, `Expected ${key} to call recordAdminAudit(...)`)
+    const hasAuditCall = routeBlock.includes('recordAdminAudit(') || routeBlock.includes('recordAdminAuditInTx(')
+    assert.equal(hasAuditCall, true, `Expected ${key} to call recordAdminAudit(...) or recordAdminAuditInTx(...)`)
   }
 })

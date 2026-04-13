@@ -2,6 +2,7 @@ import test, { afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import express from 'express'
 import request from 'supertest'
+import { readFile } from 'node:fs/promises'
 import adminRoutes from './admin.js'
 import { signAuthToken } from '../lib/auth.js'
 import prisma from '../db.js'
@@ -438,6 +439,9 @@ test('POST /admin/driver-applications/:id/status promotes approved passenger to 
         assert.deepEqual(args.data, { role: 'DRIVER' })
         return { count: 1 }
       }
+    },
+    adminAuditLog: {
+      create: async () => ({ id: 'audit-1' })
     }
   })
 
@@ -616,24 +620,28 @@ test('POST /admin/vehicles/:id/assign-driver allows forced offline assignment wi
 
   ;(prisma as any).vehicle = {
     findUnique: async () => ({ id: 'vehicle-1', driverId: null }),
-    findFirst: async () => null,
-    update: async () => ({
-      id: 'vehicle-1',
-      driverId: 'driver-1',
-      driver: { id: 'driver-1', name: 'Driver One', phone: '+639171234567', email: null, role: 'DRIVER' }
-    })
+    findFirst: async () => null
   }
   ;(prisma as any).user = {
     findUnique: async () => ({ id: 'driver-1', role: 'DRIVER', driverLocation: { isAvailable: false } })
   }
 
   let capturedAuditMetadata: unknown = null
-  ;(prisma as any).adminAuditLog = {
-    create: async (args: any) => {
-      capturedAuditMetadata = args.data.metadata
-      return { id: 'audit-1' }
+  ;(prisma as any).$transaction = async (fn: any) => fn({
+    vehicle: {
+      update: async () => ({
+        id: 'vehicle-1',
+        driverId: 'driver-1',
+        driver: { id: 'driver-1', name: 'Driver One', phone: '+639171234567', email: null, role: 'DRIVER' }
+      })
+    },
+    adminAuditLog: {
+      create: async (args: any) => {
+        capturedAuditMetadata = args.data.metadata
+        return { id: 'audit-1' }
+      }
     }
-  }
+  })
 
   const res = await request(app)
     .post('/admin/vehicles/vehicle-1/assign-driver')
@@ -858,6 +866,9 @@ test('POST /admin/payments/:id/verify updates payment status', async () => {
     },
     rideEvent: {
       create: async () => ({ id: 'evt-1' })
+    },
+    adminAuditLog: {
+      create: async () => ({ id: 'audit-1' })
     }
   })
 
@@ -998,6 +1009,46 @@ test('POST /admin/support/tickets/:id/status updates status and creates notifica
   assert.equal(res.status, 200)
   assert.equal(res.body.ticket.status, 'IN_REVIEW')
   assert.equal(notificationCreateCalls, 1)
+})
+
+test('POST /admin/support/tickets/:id/status dead-letters audit log when audit write fails', async () => {
+  const app = createTestApp()
+  const token = signAuthToken({
+    userId: 'admin-1',
+    phone: '+639170000001',
+    role: 'ADMIN'
+  })
+
+  const ticketId = `ticket-dead-${Date.now()}`
+
+  ;(prisma as any).supportTicket = {
+    findUnique: async () => ({ id: ticketId, userId: 'user-1', category: 'SAFETY', status: 'OPEN' })
+  }
+  ;(prisma as any).adminAuditLog = {
+    create: async () => {
+      throw new Error('simulated audit write failure')
+    }
+  }
+  ;(prisma as any).$transaction = async (fn: any) => fn({
+    supportTicket: {
+      update: async () => ({ id: ticketId, status: 'IN_REVIEW' })
+    },
+    notification: {
+      create: async () => ({ id: 'notif-1' })
+    }
+  })
+
+  const res = await request(app)
+    .post(`/admin/support/tickets/${ticketId}/status`)
+    .set('Authorization', `Bearer ${token}`)
+    .send({ status: 'IN_REVIEW', note: 'Trigger dead-letter' })
+
+  assert.equal(res.status, 200)
+
+  const deadLetterPath = process.env.ADMIN_AUDIT_DEAD_LETTER_PATH ?? '/tmp/eride-admin-audit-dead-letter.ndjson'
+  const fileText = await readFile(deadLetterPath, 'utf8')
+  assert.equal(fileText.includes(ticketId), true)
+  assert.equal(fileText.includes('"action":"SUPPORT_TICKET_STATUS_UPDATE"'), true)
 })
 
 test('GET /admin/analytics/overview returns computed metrics', async () => {

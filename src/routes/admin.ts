@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import prisma from '../db.js'
 import { Prisma } from '@prisma/client'
+import { appendFile } from 'node:fs/promises'
 import { getAuthContext, requireAdmin } from '../lib/auth.js'
 import { ADMIN_TARGET_STATUSES, appendAdminStatusNote, canTransitionApplicationStatus } from '../lib/admin-driver-applications.js'
 import { clearAssignmentTimeout, tryAssignRide } from '../services/ride-assignment.js'
@@ -26,6 +27,8 @@ const SAFETY_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const
 const SAFETY_TIMELINE_EVENT_TYPES = ['SOS_TRIGGERED', 'ADMIN_SAFETY_ACKNOWLEDGED', 'ADMIN_SAFETY_ASSIGNED', 'ADMIN_SAFETY_ESCALATED', 'ADMIN_SAFETY_RESOLVED', 'ADMIN_SAFETY_CLOSED'] as const
 const SAFETY_DELIVERY_STATUSES = ['DELIVERED', 'DEAD_LETTER'] as const
 const SAFETY_DELIVERY_CHANNELS = ['sms', 'email', 'webhook'] as const
+const ADMIN_AUDIT_MAX_RETRIES = Number(process.env.ADMIN_AUDIT_MAX_RETRIES ?? 2)
+const ADMIN_AUDIT_DEAD_LETTER_PATH = process.env.ADMIN_AUDIT_DEAD_LETTER_PATH ?? '/tmp/eride-admin-audit-dead-letter.ndjson'
 
 function parseBooleanQuery(value: unknown) {
   if (typeof value === 'boolean') return value
@@ -177,25 +180,87 @@ async function recordAdminAudit(input: {
 }) {
   const repo = (prisma as any).adminAuditLog
   if (!repo?.create) return
-  await repo.create({
-    data: {
-      adminId: input.adminId,
-      action: input.action,
-      targetType: input.targetType,
-      targetId: input.targetId ?? null,
-      summary: input.summary ?? null,
-      before: input.before ?? null,
-      after: input.after ?? null,
-      metadata: input.metadata ?? null
+  const payload = buildAdminAuditPayload(input)
+
+  let lastError: unknown = null
+  for (let attempt = 0; attempt <= ADMIN_AUDIT_MAX_RETRIES; attempt += 1) {
+    try {
+      await repo.create({ data: payload })
+      return
+    } catch (err) {
+      lastError = err
+      const known = err instanceof Prisma.PrismaClientKnownRequestError ? err.code : null
+      const retryable = known === 'P1001' || known === 'P1002' || known === 'P1008' || known === 'P1017'
+      if (!retryable || attempt >= ADMIN_AUDIT_MAX_RETRIES) break
     }
-  }).catch((err: unknown) => {
-    console.error('[admin-audit] failed to persist', {
+  }
+
+  const errorMessage = lastError instanceof Error ? lastError.message : String(lastError)
+  const deadLetter = {
+    capturedAt: new Date().toISOString(),
+    payload,
+    error: errorMessage
+  }
+
+  try {
+    await appendFile(ADMIN_AUDIT_DEAD_LETTER_PATH, `${JSON.stringify(deadLetter)}\n`, 'utf8')
+    console.error('[admin-audit] persisted to dead-letter', {
       action: input.action,
       targetType: input.targetType,
       targetId: input.targetId ?? null,
-      error: err instanceof Error ? err.message : String(err)
+      path: ADMIN_AUDIT_DEAD_LETTER_PATH,
+      error: errorMessage
     })
-  })
+  } catch (deadLetterErr) {
+    console.error('[admin-audit] failed to persist and dead-letter', {
+      action: input.action,
+      targetType: input.targetType,
+      targetId: input.targetId ?? null,
+      path: ADMIN_AUDIT_DEAD_LETTER_PATH,
+      error: errorMessage,
+      deadLetterError: deadLetterErr instanceof Error ? deadLetterErr.message : String(deadLetterErr)
+    })
+  }
+}
+
+function buildAdminAuditPayload(input: {
+  adminId: string
+  action: string
+  targetType: string
+  targetId?: string | null
+  summary?: string
+  before?: Prisma.JsonValue
+  after?: Prisma.JsonValue
+  metadata?: Prisma.JsonValue
+}) {
+  return {
+    adminId: input.adminId,
+    action: input.action,
+    targetType: input.targetType,
+    targetId: input.targetId ?? null,
+    summary: input.summary ?? null,
+    before: input.before ?? null,
+    after: input.after ?? null,
+    metadata: input.metadata ?? null
+  }
+}
+
+async function recordAdminAuditInTx(
+  tx: Prisma.TransactionClient,
+  input: {
+    adminId: string
+    action: string
+    targetType: string
+    targetId?: string | null
+    summary?: string
+    before?: Prisma.JsonValue
+    after?: Prisma.JsonValue
+    metadata?: Prisma.JsonValue
+  }
+) {
+  const repo = (tx as any).adminAuditLog
+  if (!repo?.create) return
+  await repo.create({ data: buildAdminAuditPayload(input) })
 }
 
 async function enrichSafetyIncidents(items: Array<{
@@ -381,18 +446,18 @@ router.post('/driver-applications/:id/status', async (req, res) => {
       })
     }
 
-    return updated
-  })
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'DRIVER_APPLICATION_STATUS_UPDATE',
+      targetType: 'DRIVER_APPLICATION',
+      targetId: existing.id,
+      summary: `Driver application ${existing.id.slice(0, 8)} moved from ${existing.status} to ${updated.status}`,
+      before: { status: existing.status },
+      after: { status: updated.status },
+      metadata: { reason: parsed.data.reason ?? null }
+    })
 
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'DRIVER_APPLICATION_STATUS_UPDATE',
-    targetType: 'DRIVER_APPLICATION',
-    targetId: existing.id,
-    summary: `Driver application ${existing.id.slice(0, 8)} moved from ${existing.status} to ${application.status}`,
-    before: { status: existing.status },
-    after: { status: application.status },
-    metadata: { reason: parsed.data.reason ?? null }
+    return updated
   })
 
   res.json({ ok: true, application })
@@ -413,28 +478,32 @@ router.post('/driver-applications/:id/interview', async (req, res) => {
 
   const auth = getAuthContext(res)
 
-  const application = await prisma.driverApplication.update({
-    where: { id: req.params.id },
-    data: {
-      interviewAt: new Date(parsed.data.interviewAt),
-      status: 'INTERVIEW',
-      notes: appendAdminStatusNote(existing.notes, {
-        adminId: auth.userId,
+  const application = await prisma.$transaction(async (tx) => {
+    const updated = await tx.driverApplication.update({
+      where: { id: req.params.id },
+      data: {
+        interviewAt: new Date(parsed.data.interviewAt),
         status: 'INTERVIEW',
-        reason: `Interview scheduled for ${parsed.data.interviewAt}`
-      })
-    }
-  })
+        notes: appendAdminStatusNote(existing.notes, {
+          adminId: auth.userId,
+          status: 'INTERVIEW',
+          reason: `Interview scheduled for ${parsed.data.interviewAt}`
+        })
+      }
+    })
 
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'DRIVER_APPLICATION_SCHEDULE_INTERVIEW',
-    targetType: 'DRIVER_APPLICATION',
-    targetId: existing.id,
-    summary: `Driver application ${existing.id.slice(0, 8)} interview scheduled`,
-    before: { status: existing.status, interviewAt: null },
-    after: { status: application.status, interviewAt: application.interviewAt ? application.interviewAt.toISOString() : null },
-    metadata: { scheduledAt: parsed.data.interviewAt }
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'DRIVER_APPLICATION_SCHEDULE_INTERVIEW',
+      targetType: 'DRIVER_APPLICATION',
+      targetId: existing.id,
+      summary: `Driver application ${existing.id.slice(0, 8)} interview scheduled`,
+      before: { status: existing.status, interviewAt: null },
+      after: { status: updated.status, interviewAt: updated.interviewAt ? updated.interviewAt.toISOString() : null },
+      metadata: { scheduledAt: parsed.data.interviewAt }
+    })
+
+    return updated
   })
 
   res.json({ ok: true, application })
@@ -830,18 +899,19 @@ router.post('/payments/:id/verify', async (req, res) => {
         }
       }
     })
-    return next
-  })
 
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'PAYMENT_VERIFY',
-    targetType: 'PAYMENT',
-    targetId: payment.id,
-    summary: `Payment ${payment.id.slice(0, 8)} marked VERIFIED`,
-    before: { status: payment.status },
-    after: { status: updated.status },
-    metadata: { note: parsed.data.note ?? null }
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'PAYMENT_VERIFY',
+      targetType: 'PAYMENT',
+      targetId: payment.id,
+      summary: `Payment ${payment.id.slice(0, 8)} marked VERIFIED`,
+      before: { status: payment.status },
+      after: { status: next.status },
+      metadata: { note: parsed.data.note ?? null }
+    })
+
+    return next
   })
 
   return res.json({ ok: true, payment: updated })
@@ -877,18 +947,19 @@ router.post('/payments/:id/fail', async (req, res) => {
         }
       }
     })
-    return next
-  })
 
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'PAYMENT_FAIL',
-    targetType: 'PAYMENT',
-    targetId: payment.id,
-    summary: `Payment ${payment.id.slice(0, 8)} marked FAILED`,
-    before: { status: payment.status },
-    after: { status: updated.status },
-    metadata: { reason: parsed.data.reason ?? null }
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'PAYMENT_FAIL',
+      targetType: 'PAYMENT',
+      targetId: payment.id,
+      summary: `Payment ${payment.id.slice(0, 8)} marked FAILED`,
+      before: { status: payment.status },
+      after: { status: next.status },
+      metadata: { reason: parsed.data.reason ?? null }
+    })
+
+    return next
   })
 
   return res.json({ ok: true, payment: updated })
@@ -931,18 +1002,19 @@ router.post('/payments/:id/refund', async (req, res) => {
         }
       }
     })
-    return next
-  })
 
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'PAYMENT_REFUND_REQUEST',
-    targetType: 'PAYMENT',
-    targetId: payment.id,
-    summary: `Refund requested for payment ${payment.id.slice(0, 8)}`,
-    before: { status: payment.status },
-    after: { status: updated.status },
-    metadata: { reason: parsed.data.reason, amount: parsed.data.amount ?? payment.amount }
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'PAYMENT_REFUND_REQUEST',
+      targetType: 'PAYMENT',
+      targetId: payment.id,
+      summary: `Refund requested for payment ${payment.id.slice(0, 8)}`,
+      before: { status: payment.status },
+      after: { status: next.status },
+      metadata: { reason: parsed.data.reason, amount: parsed.data.amount ?? payment.amount }
+    })
+
+    return next
   })
 
   return res.json({ ok: true, payment: updated })
@@ -2142,32 +2214,37 @@ router.post('/vehicles', async (req, res) => {
 
   const auth = getAuthContext(res)
   try {
-    const vehicle = await prisma.vehicle.create({
-      data: {
-        plateNumber: parsed.data.plateNumber.toUpperCase(),
-        model: parsed.data.model,
-        capacity: parsed.data.capacity,
-        color: parsed.data.color,
-        status: parsed.data.status ?? 'AVAILABLE',
-        batteryCapacityKwh: parsed.data.batteryCapacityKwh,
-        batteryLevel: parsed.data.batteryLevel,
-        driverId: parsed.data.driverId ?? null
-      },
-      include: {
-        driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
-      }
-    })
-    await recordAdminAudit({
-      adminId: auth.userId,
-      action: 'FLEET_CREATE_VEHICLE',
-      targetType: 'VEHICLE',
-      targetId: vehicle.id,
-      summary: `Vehicle ${vehicle.plateNumber} created`,
-      after: {
-        plateNumber: vehicle.plateNumber,
-        status: vehicle.status,
-        driverId: vehicle.driverId ?? null
-      }
+    const vehicle = await prisma.$transaction(async (tx) => {
+      const created = await tx.vehicle.create({
+        data: {
+          plateNumber: parsed.data.plateNumber.toUpperCase(),
+          model: parsed.data.model,
+          capacity: parsed.data.capacity,
+          color: parsed.data.color,
+          status: parsed.data.status ?? 'AVAILABLE',
+          batteryCapacityKwh: parsed.data.batteryCapacityKwh,
+          batteryLevel: parsed.data.batteryLevel,
+          driverId: parsed.data.driverId ?? null
+        },
+        include: {
+          driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
+        }
+      })
+
+      await recordAdminAuditInTx(tx, {
+        adminId: auth.userId,
+        action: 'FLEET_CREATE_VEHICLE',
+        targetType: 'VEHICLE',
+        targetId: created.id,
+        summary: `Vehicle ${created.plateNumber} created`,
+        after: {
+          plateNumber: created.plateNumber,
+          status: created.status,
+          driverId: created.driverId ?? null
+        }
+      })
+
+      return created
     })
     return res.status(201).json({ ok: true, vehicle })
   } catch (err) {
@@ -2222,27 +2299,31 @@ router.post('/vehicles/:id/assign-driver', async (req, res) => {
     if (assignedVehicle) return res.status(409).json({ error: 'Driver already has an assigned vehicle' })
   }
 
-  const updated = await prisma.vehicle.update({
-    where: { id: vehicle.id },
-    data: { driverId: nextDriverId },
-    include: {
-      driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
-    }
-  })
-
   const auth = getAuthContext(res)
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'FLEET_ASSIGN_DRIVER',
-    targetType: 'VEHICLE',
-    targetId: vehicle.id,
-    summary: `Vehicle ${vehicle.id.slice(0, 8)} driver assignment updated`,
-    before: { driverId: vehicle.driverId ?? null },
-    after: { driverId: nextDriverId },
-    metadata: {
-      forceAssignment: force,
-      forceReason: parsed.data.reason ?? null
-    }
+  const updated = await prisma.$transaction(async (tx) => {
+    const next = await tx.vehicle.update({
+      where: { id: vehicle.id },
+      data: { driverId: nextDriverId },
+      include: {
+        driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
+      }
+    })
+
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'FLEET_ASSIGN_DRIVER',
+      targetType: 'VEHICLE',
+      targetId: vehicle.id,
+      summary: `Vehicle ${vehicle.id.slice(0, 8)} driver assignment updated`,
+      before: { driverId: vehicle.driverId ?? null },
+      after: { driverId: nextDriverId },
+      metadata: {
+        forceAssignment: force,
+        forceReason: parsed.data.reason ?? null
+      }
+    })
+
+    return next
   })
 
   return res.json({ ok: true, vehicle: updated })
@@ -2296,36 +2377,40 @@ router.post('/vehicles/:id/status', async (req, res) => {
     }
   }
 
-  const updated = await prisma.vehicle.update({
-    where: { id: vehicle.id },
-    data: {
-      status: parsed.data.status,
-      ...(typeof parsed.data.batteryLevel === 'number' ? { batteryLevel: parsed.data.batteryLevel } : {})
-    },
-    include: {
-      driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
-    }
-  })
-
   const auth = getAuthContext(res)
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'FLEET_UPDATE_STATUS',
-    targetType: 'VEHICLE',
-    targetId: vehicle.id,
-    summary: `Vehicle ${vehicle.id.slice(0, 8)} status updated from ${vehicle.status} to ${parsed.data.status}`,
-    before: {
-      status: vehicle.status,
-      batteryLevel: vehicle.batteryLevel ?? null
-    },
-    after: {
-      status: parsed.data.status,
-      batteryLevel: typeof parsed.data.batteryLevel === 'number' ? parsed.data.batteryLevel : vehicle.batteryLevel ?? null
-    },
-    metadata: {
-      transition: `${vehicle.status}->${parsed.data.status}`,
-      hasDriver: Boolean(vehicle.driverId)
-    }
+  const updated = await prisma.$transaction(async (tx) => {
+    const next = await tx.vehicle.update({
+      where: { id: vehicle.id },
+      data: {
+        status: parsed.data.status,
+        ...(typeof parsed.data.batteryLevel === 'number' ? { batteryLevel: parsed.data.batteryLevel } : {})
+      },
+      include: {
+        driver: { select: { id: true, name: true, phone: true, email: true, role: true } }
+      }
+    })
+
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'FLEET_UPDATE_STATUS',
+      targetType: 'VEHICLE',
+      targetId: vehicle.id,
+      summary: `Vehicle ${vehicle.id.slice(0, 8)} status updated from ${vehicle.status} to ${parsed.data.status}`,
+      before: {
+        status: vehicle.status,
+        batteryLevel: vehicle.batteryLevel ?? null
+      },
+      after: {
+        status: parsed.data.status,
+        batteryLevel: typeof parsed.data.batteryLevel === 'number' ? parsed.data.batteryLevel : vehicle.batteryLevel ?? null
+      },
+      metadata: {
+        transition: `${vehicle.status}->${parsed.data.status}`,
+        hasDriver: Boolean(vehicle.driverId)
+      }
+    })
+
+    return next
   })
 
   return res.json({ ok: true, vehicle: updated })
@@ -2365,49 +2450,53 @@ router.put('/pricing', async (req, res) => {
   }
 
   const auth = getAuthContext(res)
-  const previous = await prisma.fareConfig.findUnique({ where: { id: 'default' } })
+  const config = await prisma.$transaction(async (tx) => {
+    const previous = await tx.fareConfig.findUnique({ where: { id: 'default' } })
 
-  const config = await prisma.fareConfig.upsert({
-    where: { id: 'default' },
-    update: {
-      baseFare: parsed.data.baseFare,
-      perKmRate: parsed.data.perKmRate,
-      perMinuteRate: parsed.data.perMinuteRate,
-      minimumFare: parsed.data.minimumFare,
-      currency: (parsed.data.currency ?? 'PHP').toUpperCase()
-    },
-    create: {
-      id: 'default',
-      baseFare: parsed.data.baseFare,
-      perKmRate: parsed.data.perKmRate,
-      perMinuteRate: parsed.data.perMinuteRate,
-      minimumFare: parsed.data.minimumFare,
-      currency: (parsed.data.currency ?? 'PHP').toUpperCase()
-    }
-  })
-
-  await recordAdminAudit({
-    adminId: auth.userId,
-    action: 'PRICING_UPDATE',
-    targetType: 'FARE_CONFIG',
-    targetId: 'default',
-    summary: 'Updated fare configuration',
-    before: previous
-      ? {
-        baseFare: previous.baseFare,
-        perKmRate: previous.perKmRate,
-        perMinuteRate: previous.perMinuteRate,
-        minimumFare: previous.minimumFare,
-        currency: previous.currency
+    const next = await tx.fareConfig.upsert({
+      where: { id: 'default' },
+      update: {
+        baseFare: parsed.data.baseFare,
+        perKmRate: parsed.data.perKmRate,
+        perMinuteRate: parsed.data.perMinuteRate,
+        minimumFare: parsed.data.minimumFare,
+        currency: (parsed.data.currency ?? 'PHP').toUpperCase()
+      },
+      create: {
+        id: 'default',
+        baseFare: parsed.data.baseFare,
+        perKmRate: parsed.data.perKmRate,
+        perMinuteRate: parsed.data.perMinuteRate,
+        minimumFare: parsed.data.minimumFare,
+        currency: (parsed.data.currency ?? 'PHP').toUpperCase()
       }
-      : null,
-    after: {
-      baseFare: config.baseFare,
-      perKmRate: config.perKmRate,
-      perMinuteRate: config.perMinuteRate,
-      minimumFare: config.minimumFare,
-      currency: config.currency
-    }
+    })
+
+    await recordAdminAuditInTx(tx, {
+      adminId: auth.userId,
+      action: 'PRICING_UPDATE',
+      targetType: 'FARE_CONFIG',
+      targetId: 'default',
+      summary: 'Updated fare configuration',
+      before: previous
+        ? {
+          baseFare: previous.baseFare,
+          perKmRate: previous.perKmRate,
+          perMinuteRate: previous.perMinuteRate,
+          minimumFare: previous.minimumFare,
+          currency: previous.currency
+        }
+        : null,
+      after: {
+        baseFare: next.baseFare,
+        perKmRate: next.perKmRate,
+        perMinuteRate: next.perMinuteRate,
+        minimumFare: next.minimumFare,
+        currency: next.currency
+      }
+    })
+
+    return next
   })
 
   return res.json({ ok: true, config })
