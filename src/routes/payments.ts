@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import { Prisma } from '@prisma/client'
 import prisma from '../db.js'
 import { getAuthContext, requireAuth } from '../lib/auth.js'
 import { canRechargeFromStatus, canTransitionPaymentStatus, getPaymentProvider, isPaymentWebhookAuthorized } from '../services/payments.js'
@@ -7,6 +8,10 @@ import { canRechargeFromStatus, canTransitionPaymentStatus, getPaymentProvider, 
 const router = Router()
 const PAYMENT_METHODS = ['CASH', 'EWALLET', 'CARD'] as const
 const PAYMENT_STATES = ['PENDING', 'PAID', 'VERIFIED', 'FAILED', 'REFUND_PENDING', 'REFUNDED'] as const
+
+function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue
+}
 
 router.get('/methods', (_req, res) => {
   res.json({ methods: ['CASH', 'EWALLET', 'CARD'] })
@@ -166,19 +171,21 @@ router.post('/webhooks/:provider', async (req, res) => {
       data: { status: event.status }
     })
 
+    const metadata: Prisma.InputJsonValue = {
+      paymentId: payment.id,
+      provider: provider.name,
+      eventId: event.eventId,
+      reference: event.providerReference,
+      previousStatus: payment.status,
+      nextStatus: event.status,
+      raw: toInputJsonValue(event.raw)
+    }
+
     await tx.rideEvent.create({
       data: {
         rideId: payment.rideId,
         type: 'PAYMENT_WEBHOOK_STATUS_CHANGED',
-        metadata: {
-          paymentId: payment.id,
-          provider: provider.name,
-          eventId: event.eventId,
-          reference: event.providerReference,
-          previousStatus: payment.status,
-          nextStatus: event.status,
-          raw: event.raw
-        }
+        metadata
       }
     }).catch(() => null)
 
