@@ -136,7 +136,7 @@ router.get('/route', async (req, res) => {
       headers: {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': GOOGLE_API_KEY,
-        'X-Goog-FieldMask': `routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline${optimal ? ',routes.travelAdvisory.tollInfo' : ''}`
+        'X-Goog-FieldMask': `routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.travelAdvisory.speedReadingIntervals${optimal ? ',routes.travelAdvisory.tollInfo' : ''}`
       },
       body: JSON.stringify({
         origin: { location: { latLng: { latitude: originLat, longitude: originLng } } },
@@ -170,11 +170,21 @@ router.get('/route', async (req, res) => {
     ? Number(tollPrice.units ?? 0) + (tollPrice.nanos ?? 0) / 1e9
     : 0
 
+  // Parse speed reading intervals for traffic-coloured route rendering.
+  // Google omits startPolylinePointIndex when it is 0 (protobuf default suppression).
+  const rawIntervals = route.travelAdvisory?.speedReadingIntervals ?? []
+  const speedIntervals = rawIntervals.map((i: any) => ({
+    startIndex: i.startPolylinePointIndex ?? 0,
+    endIndex: i.endPolylinePointIndex ?? 0,
+    speed: i.speed as 'NORMAL' | 'SLOW' | 'TRAFFIC_JAM'
+  }))
+
   return res.json({
     polyline: route.polyline?.encodedPolyline ?? '',
     distanceMeters: route.distanceMeters ?? 0,
     durationSeconds,
-    tollEstimate
+    tollEstimate,
+    speedIntervals
   })
 })
 
